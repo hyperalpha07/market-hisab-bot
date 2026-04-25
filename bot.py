@@ -1,5 +1,5 @@
-# FULL FINAL BOT.PY
-# Market Hisab Bot + AI Bangla Chat + Bazar Assistant + Need List + Auto Memory
+# FINAL CLEAN BOT.PY
+# Market Hisab Bot + AI Bangla Chat + Bazar Assistant + Need List + Auto Memory Roast Mode
 
 import os
 import json
@@ -66,7 +66,8 @@ processed_payment_rows = set()
 repair_mode = False
 
 user_pending_bazar: Dict[str, Dict[str, Any]] = {}
-user_pending_memory: Dict[str, Dict[str, Any]] = {}
+# Memory auto-save: no confirmation template; bot learns only when users talk about someone
+last_person_context: Dict[str, str] = {}
 
 BN_ITEM_MAP = {
     "chal": "চাল", "cal": "চাল", "rice": "চাল",
@@ -544,23 +545,43 @@ def save_chat_log(user_id: str, member: str, message: str, reply: str, typ: str,
         print("Chat log save failed:", exc)
 
 
-def find_target_name(text: str) -> str:
+def find_target_name(text: str, uid: str = "") -> str:
     low = text.lower()
     for key, val in NAME_MAP.items():
         if key in low:
+            if uid:
+                last_person_context[uid] = val
             return val
+
+    # If user says "tar nickname..." after mentioning a person, continue that context
+    if uid and uid in last_person_context:
+        pronoun_markers = ["tar", "তার", "take", "ওকে", "or", "ওর", "se ", "সে "]
+        if any(m in low for m in pronoun_markers):
+            return last_person_context[uid]
+
     return ""
 
 
-def detect_memory_text(text: str, speaker_member: str) -> Optional[Dict[str, str]]:
+def extract_after_patterns(text: str, patterns: List[str]) -> str:
     raw = text.strip()
     low = raw.lower()
-    target = find_target_name(raw)
+    for pat in patterns:
+        m = re.search(pat, low, flags=re.I)
+        if m:
+            return m.group(1).strip(" .,!।")[:60]
+    return ""
+
+
+def detect_memory_text(text: str, speaker_member: str, uid: str = "") -> Optional[Dict[str, str]]:
+    raw = text.strip()
+    low = raw.lower()
+    target = find_target_name(raw, uid)
     if not target:
         return None
 
     memory_keywords = [
         "amar", "amr", "আমার", "mama", "মামা", "vai", "ভাই", "friend", "bondhu", "বন্ধু",
+        "nickname", "nick name", "ডাকনাম", "nam hobe", "name hobe", "hobe", "হবে", "holo", "হলো",
         "chitar", "cheater", "চিটার", "valo", "ভালো", "kharap", "খারাপ", "smart", "lazy", "লেজি", "boka", "বোকা",
         "hutas", "hutase", "হুটাস", "হুটাসে", "nator", "drama", "নাটক", "boss", "admin"
     ]
@@ -571,7 +592,7 @@ def detect_memory_text(text: str, speaker_member: str) -> Optional[Dict[str, str
     nickname = ""
     tags = []
     inside_jokes = []
-    bot_style = "funny roast"
+    bot_style = "roast বেশি, মজা করে reply"
 
     if "mama" in low or "মামা" in low:
         relation = f"{speaker_member}-এর মামা"
@@ -581,11 +602,25 @@ def detect_memory_text(text: str, speaker_member: str) -> Optional[Dict[str, str
     if "friend" in low or "bondhu" in low or "বন্ধু" in low:
         relation = relation or "বন্ধু"
 
+    nick = extract_after_patterns(raw, [
+        r"nickname\s*(?:hobe|holo|is|=)\s*([^.,।!]+)",
+        r"nick\s*name\s*(?:hobe|holo|is|=)\s*([^.,।!]+)",
+        r"ডাকনাম\s*(?:হবে|হলো|=)\s*([^.,।!]+)",
+        r"নাম\s*(?:হবে|হলো|=)\s*([^.,।!]+)",
+    ])
+    if nick:
+        nickname = nick
+        inside_jokes.append(nick)
+        tags.append("nickname")
+
     if "chitar" in low or "cheater" in low or "চিটার" in low:
-        nickname = "চিটার মামা" if ("mama" in low or "মামা" in low) else "চিটার"
+        if not nickname:
+            nickname = "চিটার মামা" if ("mama" in low or "মামা" in low or "মামা" in relation) else "চিটার"
         inside_jokes.append("চিটার")
         tags.append("roast")
     if "hutase" in low or "hutas" in low or "হুটাস" in low or "হুটাসে" in low:
+        if not nickname:
+            nickname = "হুটাসে চলে"
         inside_jokes.append("হুটাসে চলে")
         tags.append("inside-joke")
     if "smart" in low:
@@ -597,7 +632,7 @@ def detect_memory_text(text: str, speaker_member: str) -> Optional[Dict[str, str
         inside_jokes.append("নাটক করে")
     if "boss" in low or "admin" in low:
         tags.append("boss")
-        bot_style = "respect+fun"
+        bot_style = "respect+fun+roast"
     if "valo" in low or "ভালো" in low:
         tags.append("good")
     if "kharap" in low or "খারাপ" in low:
@@ -697,7 +732,7 @@ User message:
 """
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.9, "maxOutputTokens": 180},
+        "generationConfig": {"temperature": 1.08, "maxOutputTokens": 180},
     }
     try:
         r = requests.post(url, json=payload, timeout=15)
@@ -827,14 +862,12 @@ async def bazarlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    cancelled = False
     if uid in user_pending_bazar:
         user_pending_bazar.pop(uid, None)
-        cancelled = True
-    if uid in user_pending_memory:
-        user_pending_memory.pop(uid, None)
-        cancelled = True
-    await update.message.reply_text("✅ Pending কাজ cancel করা হয়েছে।" if cancelled else "কোনো pending কাজ নেই ভাই 😄")
+        await update.message.reply_text("✅ Pending বাজার cancel করা হয়েছে।")
+    else:
+        await update.message.reply_text("কোনো pending কাজ নেই ভাই 😄")
+
 
 async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -1014,27 +1047,16 @@ async def normal_message_handler(update: Update, context: ContextTypes.DEFAULT_T
     member = normalize_name(member)
     low = text.lower().strip()
 
+    # OK only confirms pending bazar. Memory is auto-saved silently and AI replies naturally.
     if low in ["ok", "okay", "ওকে", "ঠিক আছে", "হ্যাঁ", "ha", "yes"]:
-        pending_memory = user_pending_memory.get(uid)
-        if pending_memory:
-            await asyncio.to_thread(upsert_user_personality, pending_memory)
-            user_pending_memory.pop(uid, None)
-            reply = (
-                "✅ Memory save করে রাখলাম 😄\n\n"
-                f"👤 {pending_memory['name']}\n"
-                f"🏷 Nickname: {pending_memory.get('nickname') or '-'}\n"
-                f"🤝 Relation: {pending_memory.get('relation') or '-'}\n"
-                f"😂 Inside Joke: {pending_memory.get('inside_jokes') or '-'}\n\n"
-                "এখন থেকে এই তথ্য ধরে মজা করবো 😏"
-            )
-            await update.message.reply_text(reply)
-            await asyncio.to_thread(save_chat_log, uid, member, text, reply, "MEMORY_SAVE")
-            return
-
         pending = user_pending_bazar.get(uid)
         if pending:
             pending_id = pending["id"]
-            await asyncio.to_thread(append_row, PENDING_BAZAR_SHEET, [pending_id, now_str(), uid, member, pending["raw"], pending["items"], pending["total"], "USER_OK", "PENDING", "", pending.get("note", "")])
+            await asyncio.to_thread(
+                append_row,
+                PENDING_BAZAR_SHEET,
+                [pending_id, now_str(), uid, member, pending["raw"], pending["items"], pending["total"], "USER_OK", "PENDING", "", pending.get("note", "")]
+            )
             user_pending_bazar.pop(uid, None)
             admin_msg = f"🆕 নতুন বাজার approval দরকার\n\nID: {pending_id}\n👤 Buyer: {member}\n🧾 Items: {pending['items']}\n💰 Total: {format_lkr(pending['total'])} LKR\n\nApprove করতে:\n/approve {pending_id}\n\nReject করতে:\n/reject {pending_id}"
             await send_admin(context.bot, admin_msg, data)
@@ -1056,27 +1078,27 @@ async def normal_message_handler(update: Update, context: ContextTypes.DEFAULT_T
     if need_items:
         for item in need_items:
             await asyncio.to_thread(append_row, NEED_LIST_SHEET, [generate_id("ND"), now_str(), uid, member, item, "PENDING", "", "", text, ""])
-        reply = "✅ বাজার লিস্টে add করে রাখলাম:\n\n" + "\n".join([f"• {i}" for i in need_items]) + "\n\nযে বাজারে যাবে, তাকে এখন আর অজুহাত দিতে দিবো না 😄"
+
+        personality_notes = await asyncio.to_thread(get_personality_notes)
+        fun_reply = await asyncio.to_thread(gemini_reply, text, member, personality_notes)
+        if not fun_reply:
+            fun_reply = "যে বাজারে যাবে, এগুলো না কিনলে তার বিচার বসবে 😂"
+
+        reply = "✅ বাজার লিস্টে add করে রাখলাম:\n\n" + "\n".join([f"• {i}" for i in need_items]) + "\n\n" + fun_reply
         await update.message.reply_text(reply)
         await send_admin(context.bot, f"📝 NEED LIST UPDATE\n\n👤 Added by: {member}\n" + "\n".join([f"• {i}" for i in need_items]), data)
         await asyncio.to_thread(save_chat_log, uid, member, text, reply, "NEED_LIST")
         return
 
-    memory = detect_memory_text(text, member)
+    # Auto memory learning: no fixed save message, no manual OK. It writes to sheet, then AI replies naturally.
+    memory = detect_memory_text(text, member, uid)
     if memory:
-        user_pending_memory[uid] = memory
-        reply = (
-            "🧠 এটা আমি memory হিসেবে save করতে পারি:\n\n"
-            f"👤 Name: {memory['name']}\n"
-            f"🏷 Nickname: {memory.get('nickname') or '-'}\n"
-            f"🤝 Relation: {memory.get('relation') or '-'}\n"
-            f"🏷 Tags: {memory.get('tags') or '-'}\n"
-            f"😂 Inside Joke: {memory.get('inside_jokes') or '-'}\n"
-            f"📝 Note: {memory.get('notes') or '-'}\n\n"
-            "সব ঠিক থাকলে OK লিখো ✅\nভুল হলে /cancel দাও।"
-        )
+        await asyncio.to_thread(upsert_user_personality, memory)
+        personality_notes = await asyncio.to_thread(get_personality_notes)
+        ai_text = await asyncio.to_thread(gemini_reply, text, member, personality_notes)
+        reply = ai_text or safe_fun_reply(text, member)
         await update.message.reply_text(reply)
-        await asyncio.to_thread(save_chat_log, uid, member, text, reply, "MEMORY_DRAFT")
+        await asyncio.to_thread(save_chat_log, uid, member, text, reply, "MEMORY_CHAT")
         return
 
     personality_notes = await asyncio.to_thread(get_personality_notes)
@@ -1084,6 +1106,7 @@ async def normal_message_handler(update: Update, context: ContextTypes.DEFAULT_T
     reply = ai_text or safe_fun_reply(text, member)
     await update.message.reply_text(reply)
     await asyncio.to_thread(save_chat_log, uid, member, text, reply, "CHAT")
+
 
 # =========================================================
 # APP START
