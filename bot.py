@@ -41,6 +41,12 @@ ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "").strip()
 AI_ENABLED = os.getenv("AI_ENABLED", "false").strip().lower() == "true"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest").strip()
+
+# OpenAI chat brain (Luna-style). Keep Gemini as optional fallback.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini").strip()
+AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").strip().lower()
+
 ROAST_LEVEL = os.getenv("ROAST_LEVEL", "savage").strip().lower()
 
 # =========================================================
@@ -387,7 +393,7 @@ def build_help_message() -> str:
         "আলু 128 পানি 24 চাল 450 ডাল 127 মাছ 1200\n"
         "Alon amar mama, se chitar\n\n"
         f"🔧 Repair Mode: {'ON 🔧' if repair_mode else 'OFF ✅'}\n"
-        f"🤖 AI Chat: {'ON 🤖' if AI_ENABLED and GEMINI_API_KEY else 'OFF'}\n"
+        f"🤖 AI Chat: {'ON 🤖' if AI_ENABLED and (OPENAI_API_KEY or GEMINI_API_KEY) else 'OFF'}\n"
         f"🔥 Roast Level: {ROAST_LEVEL.upper()}"
     )
 
@@ -567,29 +573,42 @@ def get_personality_rows() -> List[List[str]]:
 
 
 def get_personality_notes() -> str:
+    """Return compact memory context for AI. No label-style dump in prompt."""
     rows = get_personality_rows()
     notes = []
     for row in rows[1:]:
         name = row_value(row, 1)
         if not name:
             continue
-        notes.append(
-            f"{name}: nickname={row_value(row, 2)}, relation={row_value(row, 3)}, tags={row_value(row, 4)}, inside_jokes={row_value(row, 5)}, bot_style={row_value(row, 6)}, notes={row_value(row, 7)}"
-        )
+        pieces = []
+        for idx in [2, 3, 4, 5, 7]:  # nickname, relation, tags, jokes, notes
+            val = row_value(row, idx)
+            if val:
+                # remove old report words if they accidentally got saved earlier
+                val = re.sub(r"\b(nickname|relation|inside jokes?|notes?|tags|bot_style)\s*[:=]", "", val, flags=re.I)
+                val = re.sub(r"\s+", " ", val).strip()
+                if val:
+                    pieces.append(val[:90])
+        if pieces:
+            notes.append(f"{normalize_name(name)} => " + " | ".join(pieces[:5]))
     return "\n".join(notes[:40])
 
 
 def get_member_memory(name: str) -> str:
+    """Return plain memory only, never label words like nickname/relation/notes."""
     target = normalize_name(name)
     rows = get_personality_rows()
     for row in rows[1:]:
         if normalize_name(row_value(row, 1)) == target:
             parts = []
-            if row_value(row, 2): parts.append(f"nickname: {row_value(row, 2)}")
-            if row_value(row, 3): parts.append(f"relation: {row_value(row, 3)}")
-            if row_value(row, 5): parts.append(f"inside joke: {row_value(row, 5)}")
-            if row_value(row, 7): parts.append(f"notes: {row_value(row, 7)}")
-            return "; ".join(parts)
+            for idx in [2, 3, 5, 7]:
+                val = row_value(row, idx)
+                if val:
+                    val = re.sub(r"\b(nickname|relation|inside jokes?|notes?|tags|bot_style)\s*[:=]", "", val, flags=re.I)
+                    val = re.sub(r"\s+", " ", val).strip()
+                    if val:
+                        parts.append(val[:80])
+            return " | ".join(parts[:3])
     return ""
 
 
@@ -610,16 +629,22 @@ def upsert_user_personality(memory: Dict[str, str], data: Dict[str, Any]) -> Non
     user_id = member_map.get(name, "")
     now_date = today_str()
 
+    def clean_mem(v: Any, limit: int = 120) -> str:
+        val = str(v or "").strip()
+        val = re.sub(r"\b(nickname|relation|inside jokes?|notes?|tags|bot_style)\s*[:=]", "", val, flags=re.I)
+        val = re.sub(r"\s+", " ", val).strip()
+        return val[:limit]
+
     def merge_old(old: str, new: str) -> str:
-        old = str(old or "").strip()
-        new = str(new or "").strip()
+        old = clean_mem(old, 180)
+        new = clean_mem(new, 120)
         if not new:
             return old
         if not old:
             return new
         if new.lower() in old.lower():
             return old
-        return old + ", " + new
+        return (old + ", " + new)[:240]
 
     target_row = None
     for idx, row in enumerate(rows[1:], start=2):
@@ -641,34 +666,69 @@ def upsert_user_personality(memory: Dict[str, str], data: Dict[str, Any]) -> Non
         sh.append_row([
             user_id,
             name,
-            memory.get("nickname", ""),
-            memory.get("relation", ""),
-            memory.get("tags", ""),
-            memory.get("inside_jokes", ""),
-            memory.get("bot_style", ""),
-            memory.get("notes", ""),
+            clean_mem(memory.get("nickname", "")),
+            clean_mem(memory.get("relation", "")),
+            clean_mem(memory.get("tags", "")),
+            clean_mem(memory.get("inside_jokes", "")),
+            clean_mem(memory.get("bot_style", "savage roast")),
+            clean_mem(memory.get("notes", "")),
             now_date,
         ], value_input_option="USER_ENTERED")
 
 
-def gemini_call(prompt: str, max_tokens: int = 220, temperature: float = 0.9) -> Optional[str]:
-    if not (AI_ENABLED and GEMINI_API_KEY):
+def ai_model_call(prompt: str, max_tokens: int = 220, temperature: float = 0.9) -> Optional[str]:
+    """OpenAI first. Gemini kept only as emergency fallback so old setup does not break."""
+    if not AI_ENABLED:
         return None
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=15)
-        if r.status_code != 200:
-            print("Gemini error:", r.status_code, r.text[:500])
+
+    if OPENAI_API_KEY and AI_PROVIDER in ["openai", "", "auto"]:
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": TEXT_MODEL or "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "You are a natural Telegram friend-group bot. Follow the user's language and tone. Never output debug reports."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=20)
+            if r.status_code != 200:
+                print("OpenAI error:", r.status_code, r.text[:500])
+            else:
+                data = r.json()
+                return data["choices"][0]["message"]["content"].strip()
+        except Exception as exc:
+            print("OpenAI request failed:", exc)
+
+    if GEMINI_API_KEY:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+        }
+        try:
+            r = requests.post(url, json=payload, timeout=15)
+            if r.status_code != 200:
+                print("Gemini error:", r.status_code, r.text[:500])
+                return None
+            data = r.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception as exc:
+            print("Gemini request failed:", exc)
             return None
-        data = r.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception as exc:
-        print("Gemini request failed:", exc)
-        return None
+
+    return None
+
+
+# Backward-compatible name; old parts calling gemini_call will still work.
+def gemini_call(prompt: str, max_tokens: int = 220, temperature: float = 0.9) -> Optional[str]:
+    return ai_model_call(prompt, max_tokens=max_tokens, temperature=temperature)
 
 
 def extract_json_object(text: str) -> Optional[dict]:
@@ -688,7 +748,6 @@ def detect_member_in_text(text: str, data: Dict[str, Any]) -> Optional[str]:
     for name in get_member_names(data):
         if name.lower() in low:
             return normalize_name(name)
-    # Bengali/common aliases fallback
     aliases = {
         "আলফা": "ALPHA", "alpha": "ALPHA",
         "সুরজ": "SURJO", "সূর্য": "SURJO", "surjo": "SURJO",
@@ -701,16 +760,74 @@ def detect_member_in_text(text: str, data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def rule_extract_memory(user_text: str, speaker: str, data: Dict[str, Any], uid: str) -> Optional[Dict[str, str]]:
+    text = user_text.strip()
+    low = text.lower()
+    target = detect_member_in_text(text, data)
+
+    if not target and any(x in low for x in ["tar nickname", "tar nick", "তার nickname", "তার ডাকনাম", "nickname hobe", "nickname holo"]):
+        target = user_last_subject.get(uid)
+
+    if not target:
+        return None
+
+    user_last_subject[uid] = target
+    nickname = ""
+    relation = ""
+    tags = []
+    inside = []
+    notes = []
+
+    nick_match = re.search(r"(?:nickname|nick|ডাকনাম)\s*(?:hobe|holo|হবে|হলো|=|:)\s*([A-Za-z\u0980-\u09FF\s]+)", text, re.I)
+    if nick_match:
+        nickname = nick_match.group(1).strip(" .,!।")[:50]
+
+    if any(x in low for x in ["mama", "মামা"]):
+        relation = f"{speaker}-এর মামা"
+        tags.append("mama")
+
+    roast_words = {
+        "chitar": "চিটার", "cheater": "চিটার", "চিটার": "চিটার",
+        "hutase": "হুটাসে চলে", "hutashe": "হুটাসে চলে", "হুটাসে": "হুটাসে চলে",
+        "lazy": "lazy", "লেজি": "লেজি", "boka": "বোকা", "বোকা": "বোকা",
+        "drama": "drama", "নাটক": "নাটক", "mal": "মাল", "joss": "জোস",
+    }
+    for k, v in roast_words.items():
+        if k in low:
+            inside.append(v)
+            tags.append("roast")
+
+    memory_keywords = ["amar", "amr", "আমার", "se", "সে", "onek", "boro", "বড়", "valo", "ভালো", "kharap", "খারাপ", "smart", "friend", "bondhu", "বন্ধু", "posondo", "পছন্দ"]
+    if not (nickname or relation or inside) and any(k in low for k in memory_keywords):
+        notes.append(text[:100])
+
+    if not (nickname or relation or inside or notes):
+        return None
+
+    if inside and not nickname and ("mama" in low or "মামা" in low) and "চিটার" in inside:
+        nickname = "চিটার মামা"
+
+    return {
+        "name": target,
+        "nickname": nickname,
+        "relation": relation,
+        "tags": ",".join(dict.fromkeys(tags)),
+        "inside_jokes": ", ".join(dict.fromkeys(inside)),
+        "bot_style": "savage roast",
+        "notes": "; ".join(dict.fromkeys(notes))[:100],
+    }
+
+
 def ai_extract_memory(user_text: str, speaker: str, data: Dict[str, Any]) -> Optional[Dict[str, str]]:
     members = ", ".join(get_member_names(data))
     prompt = f"""
-Extract short memory from Bangla/Banglish chat.
+Extract memory from Bangla/Banglish Telegram chat.
 Known members: {members}
 Speaker: {speaker}
 Message: {user_text}
 
-Return ONLY JSON.
-If useful memory about a known member:
+Return ONLY valid JSON.
+If useful memory about a known member, return:
 {{"save":true,"name":"MEMBER_NAME","nickname":"","relation":"","tags":"","inside_jokes":"","bot_style":"savage roast","notes":"very short note"}}
 If not useful:
 {{"save":false}}
@@ -721,18 +838,21 @@ Rules:
 - notes max 8 words.
 - inside_jokes max 5 words.
 - Do NOT copy full message.
+- No markdown.
 """
-    out = gemini_call(prompt, max_tokens=120, temperature=0.1)
+    out = ai_model_call(prompt, max_tokens=120, temperature=0.1)
     obj = extract_json_object(out or "")
     if not obj or not obj.get("save"):
         return None
-
     name = normalize_name(obj.get("name", ""))
     if name not in get_member_names(data):
         return None
 
     def short(v: Any, limit: int = 60) -> str:
-        return str(v or "").strip()[:limit]
+        val = str(v or "").strip()
+        val = re.sub(r"\b(nickname|relation|inside jokes?|notes?|tags|bot_style)\s*[:=]", "", val, flags=re.I)
+        val = re.sub(r"\s+", " ", val).strip()
+        return val[:limit]
 
     return {
         "name": name,
@@ -747,79 +867,61 @@ Rules:
 
 def savage_fallback_reply(user_text: str, member: str, data: Dict[str, Any]) -> str:
     target = detect_member_in_text(user_text, data) or member
-    saved_memory = get_member_memory(target)
-
-    if saved_memory:
-        memory = saved_memory.split(",")[0].strip()
-        memory = f" — {memory}" if memory else ""
-    else:
-        memory = ""
-
-    templates = [
-        "{target} আবার scene-এ? 😏{memory} এই character-এর জন্য আলাদা warning label লাগে 😂",
-        "{target} নাম শুনলেই মনে হয় শান্তি logout, drama login 😭😂{memory}",
-        "ওই {target} তো full suspicious package 😏{memory} handle করতে গেলে patience লাগে 😂",
-        "{target} কে serious নিও না ভাই, ওর system-এ bug আগে থেকেই আছে 😂{memory}",
-        "আবার {target} নিয়ে কাহিনি? 😏{memory} এই case তো roast-ready 😂",
-    ]
-
-    msg = random.choice(templates).format(target=target, memory=memory)
-    return re.sub(r"\s+", " ", msg).strip()[:260]
+    memory = get_member_memory(target)
+    if target != member and memory:
+        return f"{target} এর কথা বলছো? 😏 {memory.split('|')[0].strip()} — এই লোকটা আলাদা লেভেলের কেস ভাই 😂"[:260]
+    if target != member:
+        return f"{target} এর কথা বলছো? 😏 ওর নাম শুনলেই মনে হয় গ্রুপে শান্তি থাকবে না 😂"[:260]
+    return f"হাহাহা {member}, কথাটা শুনে মনে হচ্ছে আজকে গ্রুপে আবার আগুন লাগবে 😏😂"[:260]
 
 
 def ai_chat_reply(user_text: str, member: str, data: Dict[str, Any]) -> Optional[str]:
     notes = get_personality_notes()
     members = ", ".join(get_member_names(data))
     prompt = f"""
-তুমি close friend Telegram group-এর savage roaster bot।
+তুমি close friend Telegram group-এর natural savage roaster bot.
 
-কঠোর নিয়ম:
-- শুধু ১টা short savage reply দিবে।
-- কোনো report না।
-- কোনো explanation না।
-- কোনো JSON না।
-- কোনো bracket/parenthesis না।
-- nickname, relation, tags, inside_jokes, notes এই শব্দগুলো reply-তে লেখা যাবে না।
-- Stored memory থাকলে শুধু joke হিসেবে ব্যবহার করবে, data dump করবে না।
-- reply হবে বাংলা/Banglish natural style।
-- ১ লাইনের বেশি না।
-- religion/race/health/body/family নিয়ে hard insult না।
-- explicit গালি না, কিন্তু sharp খোঁচা দিবে।
+Personality:
+- Luna bot-এর মতো natural, warm, human-like reply দিবে।
+- কিন্তু এই bot বেশি savage/funny roast mood-এ থাকবে।
+- User যেভাবে কথা বলবে, সেই vibe ধরে reply দিবে।
+- reply বাংলা/Banglish mixed হতে পারে, natural হতে হবে।
+- কোনো report, debug, analysis, list, JSON দিবে না।
+- nickname/relation/tags/inside_jokes/notes এই শব্দগুলো reply-তে লেখা যাবে না।
+- Stored memory থাকলে data হিসেবে dump না করে joke হিসেবে naturally use করবে।
+- ১-৩ লাইনের বেশি না।
+- religion/race/health/body/family নিয়ে hard insult করবে না।
+- explicit গালি avoid করবে, কিন্তু sharp খোঁচা দিবে।
+- কোনো fixed template না; প্রতিবার fresh reply।
 
-Known members: {members}
+Known friends: {members}
 Current user: {member}
-Memory for context only, never repeat as data:
+Context memory, use only as background:
 {notes}
 
-User message: {user_text}
+User message:
+{user_text}
 
-Only one savage reply:
+Now reply naturally like a savage close friend:
 """
-    return gemini_call(prompt, max_tokens=80, temperature=1.2)
+    return ai_model_call(prompt, max_tokens=180, temperature=1.15)
 
 
 def clean_ai_reply(ai: str) -> Optional[str]:
     if not ai:
         return None
-
-    bad_words = [
-        "nickname", "relation", "inside joke", "inside_joke", "inside_jokes",
-        "notes", "tags", "bot_style", "stored memory", "memory", "json",
-        "নোট", "রিলেশন", "ডাকনাম"
-    ]
-
     text = ai.replace("```", "").strip()
-    text = re.sub(r"\([^)]*(nickname|relation|inside|notes|tags|memory|ডাকনাম|নোট)[^)]*\)", "", text, flags=re.I)
     text = re.sub(r"\{.*?\}", "", text, flags=re.S)
     text = re.sub(r"\s+", " ", text).strip()
 
+    bad_words = [
+        "nickname", "relation", "inside joke", "inside_joke", "inside_jokes",
+        "notes", "tags", "bot_style", "stored memory", "json", "debug", "analysis",
+        "ডাকনাম", "রিলেশন", "নোট", "ট্যাগ"
+    ]
     if any(w.lower() in text.lower() for w in bad_words):
         return None
-
-    if ":" in text and any(k in text.lower() for k in ["nickname", "relation", "notes", "inside"]):
-        return None
-
-    return text[:260] if text else None
+    return text[:350] if text else None
 
 
 def final_chat_reply(user_text: str, member: str, data: Dict[str, Any]) -> str:
@@ -827,6 +929,19 @@ def final_chat_reply(user_text: str, member: str, data: Dict[str, Any]) -> str:
     cleaned = clean_ai_reply(ai or "")
     if cleaned:
         return cleaned
+
+    # Second chance with zero memory if model tried to dump context.
+    prompt = f"""
+Reply to this Bangla/Banglish Telegram message as a close friend.
+Tone: natural, funny, savage roast, warm.
+No report. No labels. No JSON. Max 2 lines.
+Message: {user_text}
+"""
+    ai2 = ai_model_call(prompt, max_tokens=100, temperature=1.2)
+    cleaned2 = clean_ai_reply(ai2 or "")
+    if cleaned2:
+        return cleaned2
+
     return savage_fallback_reply(user_text, member, data)
 
 # =========================================================
@@ -850,6 +965,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🆔 Your Telegram ID: {update.effective_user.id}")
+
+
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await get_cached_data(force=True)
@@ -861,7 +978,8 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Auto scan: {SCAN_INTERVAL_SECONDS}s\n"
             f"Repair Mode: {'ON' if repair_mode else 'OFF'}\n"
             f"AI Enabled: {AI_ENABLED}\n"
-            f"Gemini Model: {GEMINI_MODEL}\n\n"
+            f"AI Provider: {AI_PROVIDER}\n"
+            f"Text Model: {TEXT_MODEL if OPENAI_API_KEY else GEMINI_MODEL}\n\n"
             "Sheets:\n- " + "\n- ".join(data["sheet_titles"])
         )
     except Exception as exc:
@@ -922,7 +1040,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 BOT STATUS\n\n"
         f"Repair Mode: {'ON 🔧' if repair_mode else 'OFF ✅'}\n"
-        f"AI Chat: {'ON 🤖' if AI_ENABLED and GEMINI_API_KEY else 'OFF'}\n"
+        f"AI Chat: {'ON 🤖' if AI_ENABLED and (OPENAI_API_KEY or GEMINI_API_KEY) else 'OFF'}\n"
         f"Roast Level: {ROAST_LEVEL.upper()} 🔥\n"
         f"Month: {data['selected_month']}\n"
         f"Members: {len(data['member_map'])}\n"
@@ -1329,23 +1447,18 @@ async def normal_message_handler(update: Update, context: ContextTypes.DEFAULT_T
         await asyncio.to_thread(save_chat_log, uid, member, text, reply, "NEED_DRAFT")
         return
 
-    # Memory learning: rule first, AI second. Silent save; no fixed memory message.
-        # Auto memory save silently. Error হলেও bot reply বন্ধ হবে না.
+    # Memory learning: rule first, AI second. Silent save; error হলেও reply বন্ধ হবে না.
     try:
         memory = await asyncio.to_thread(rule_extract_memory, text, member, data, uid)
-
         if not memory:
             memory = await asyncio.to_thread(ai_extract_memory, text, member, data)
-
         if memory:
             await asyncio.to_thread(upsert_user_personality, memory, data)
             data = await refresh_cache()
-
     except Exception as exc:
         print("Memory save error:", repr(exc))
         print(traceback.format_exc())
 
-    # Always reply. Gemini/memory fail হলেও fallback savage reply দিবে.
     try:
         reply = await asyncio.to_thread(final_chat_reply, text, member, data)
     except Exception as exc:
@@ -1358,6 +1471,7 @@ async def normal_message_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     await update.message.reply_text(reply)
     await asyncio.to_thread(save_chat_log, uid, member, text, reply, "CHAT")
+
 # =========================================================
 # BOT SETUP
 # =========================================================
@@ -1394,6 +1508,8 @@ def main():
     print("Spreadsheet ID:", SPREADSHEET_ID)
     print("Service account:", get_service_account_email())
     print("AI Enabled:", AI_ENABLED)
+    print("AI Provider:", AI_PROVIDER)
+    print("Text Model:", TEXT_MODEL)
     print("Roast Level:", ROAST_LEVEL)
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
