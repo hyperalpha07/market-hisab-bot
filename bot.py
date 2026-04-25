@@ -1330,34 +1330,34 @@ async def normal_message_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # Memory learning: rule first, AI second. Silent save; no fixed memory message.
-    memory = await asyncio.to_thread(rule_extract_memory, text, member, data, uid)
-    if not memory:
-            # Auto memory save silently. Error হলেও bot reply বন্ধ হবে না.
+        # Auto memory save silently. Error হলেও bot reply বন্ধ হবে না.
     try:
-    # Auto memory save silently. Error হলেও bot reply বন্ধ হবে না.
-try:
-    memory = await asyncio.to_thread(ai_extract_memory, text, member, data)
-    if memory:
-        await asyncio.to_thread(upsert_user_personality, memory, data)
-        data = await refresh_cache()
-except Exception as exc:
-    print("Memory save error:", repr(exc))
-    print(traceback.format_exc())
+        memory = await asyncio.to_thread(rule_extract_memory, text, member, data, uid)
 
-# Always reply. Gemini/memory fail হলেও fallback savage reply দিবে.
-try:
-    reply = await asyncio.to_thread(final_chat_reply, text, member, data)
-except Exception as exc:
-    print("Final chat reply error:", repr(exc))
-    print(traceback.format_exc())
-    reply = savage_fallback_reply(text, member, data)
+        if not memory:
+            memory = await asyncio.to_thread(ai_extract_memory, text, member, data)
 
-if not reply:
-    reply = savage_fallback_reply(text, member, data)
+        if memory:
+            await asyncio.to_thread(upsert_user_personality, memory, data)
+            data = await refresh_cache()
 
-await update.message.reply_text(reply)
-await asyncio.to_thread(save_chat_log, uid, member, text, reply, "CHAT")
+    except Exception as exc:
+        print("Memory save error:", repr(exc))
+        print(traceback.format_exc())
 
+    # Always reply. Gemini/memory fail হলেও fallback savage reply দিবে.
+    try:
+        reply = await asyncio.to_thread(final_chat_reply, text, member, data)
+    except Exception as exc:
+        print("Final chat reply error:", repr(exc))
+        print(traceback.format_exc())
+        reply = savage_fallback_reply(text, member, data)
+
+    if not reply:
+        reply = savage_fallback_reply(text, member, data)
+
+    await update.message.reply_text(reply)
+    await asyncio.to_thread(save_chat_log, uid, member, text, reply, "CHAT")
 # =========================================================
 # BOT SETUP
 # =========================================================
