@@ -701,165 +701,132 @@ def detect_member_in_text(text: str, data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def rule_extract_memory(user_text: str, speaker: str, data: Dict[str, Any], uid: str) -> Optional[Dict[str, str]]:
-    text = user_text.strip()
-    low = text.lower()
-    target = detect_member_in_text(text, data)
-
-    # If message says "tar nickname...", use last target for this user.
-    if not target and any(x in low for x in ["tar nickname", "tar nick", "তার nickname", "তার ডাকনাম", "nickname hobe", "nickname holo"]):
-        target = user_last_subject.get(uid)
-
-    if not target:
-        return None
-
-    user_last_subject[uid] = target
-
-    nickname = ""
-    relation = ""
-    tags = []
-    inside = []
-    notes = []
-
-    nick_match = re.search(r"(?:nickname|nick|ডাকনাম)\s*(?:hobe|holo|হবে|হলো|=|:)\s*([A-Za-z\u0980-\u09FF\s]+)", text, re.I)
-    if nick_match:
-        nickname = nick_match.group(1).strip(" .,!।")[:60]
-        notes.append(f"Nickname set: {nickname}")
-
-    if any(x in low for x in ["mama", "মামা"]):
-        relation = f"{speaker}-এর মামা"
-        tags.append("mama")
-        notes.append("মামা relation")
-
-    roast_words = {
-        "chitar": "চিটার", "cheater": "চিটার", "চিটার": "চিটার",
-        "hutase": "হুটাসে চলে", "hutashe": "হুটাসে চলে", "হুটাসে": "হুটাসে চলে",
-        "lazy": "lazy", "লেজি": "লেজি", "boka": "বোকা", "বোকা": "বোকা",
-        "drama": "drama", "নাটক": "নাটক",
-    }
-    for k, v in roast_words.items():
-        if k in low:
-            inside.append(v)
-            tags.append("roast")
-
-    # Generic useful facts: if target plus descriptor words, save note.
-    memory_keywords = ["amar", "amr", "আমার", "se", "সে", "onno", "onek", "boro", "বড়", "valo", "ভালো", "kharap", "খারাপ", "smart", "friend", "bondhu", "বন্ধু"]
-    if not (nickname or relation or inside) and any(k in low for k in memory_keywords):
-        notes.append(text[:160])
-
-    if not (nickname or relation or inside or notes):
-        return None
-
-    if inside and not nickname and ("mama" in low or "মামা" in low) and "চিটার" in inside:
-        nickname = "চিটার মামা"
-
-    return {
-        "name": target,
-        "nickname": nickname,
-        "relation": relation,
-        "tags": ",".join(dict.fromkeys(tags)),
-        "inside_jokes": ", ".join(dict.fromkeys(inside)),
-        "bot_style": "savage roast",
-        "notes": "; ".join(dict.fromkeys(notes)) or text[:160],
-    }
-
-
 def ai_extract_memory(user_text: str, speaker: str, data: Dict[str, Any]) -> Optional[Dict[str, str]]:
     members = ", ".join(get_member_names(data))
     prompt = f"""
-You extract memory facts from casual Bangla/Banglish Telegram chat.
+Extract short memory from Bangla/Banglish chat.
 Known members: {members}
 Speaker: {speaker}
 Message: {user_text}
 
-Return ONLY JSON. No markdown.
-If the message says a fact, nickname, relation, habit, joke, or opinion about a known member, return:
-{{"save":true,"name":"MEMBER_NAME","nickname":"","relation":"","tags":"","inside_jokes":"","bot_style":"savage roast","notes":"short Bangla/Banglish note"}}
-If there is no useful memory, return:
+Return ONLY JSON.
+If useful memory about a known member:
+{{"save":true,"name":"MEMBER_NAME","nickname":"","relation":"","tags":"","inside_jokes":"","bot_style":"savage roast","notes":"very short note"}}
+If not useful:
 {{"save":false}}
+
 Rules:
 - Do not invent.
 - name must be one known member.
-- Keep nickname short.
-- Keep inside_jokes short.
-- Keep notes short. Do not copy the whole message.
+- notes max 8 words.
+- inside_jokes max 5 words.
+- Do NOT copy full message.
 """
-    out = gemini_call(prompt, max_tokens=170, temperature=0.1)
+    out = gemini_call(prompt, max_tokens=120, temperature=0.1)
     obj = extract_json_object(out or "")
     if not obj or not obj.get("save"):
         return None
+
     name = normalize_name(obj.get("name", ""))
     if name not in get_member_names(data):
         return None
+
+    def short(v: Any, limit: int = 60) -> str:
+        return str(v or "").strip()[:limit]
+
     return {
         "name": name,
-        "nickname": str(obj.get("nickname", "")).strip(),
-        "relation": str(obj.get("relation", "")).strip(),
-        "tags": str(obj.get("tags", "")).strip(),
-        "inside_jokes": str(obj.get("inside_jokes", "")).strip(),
-        "bot_style": str(obj.get("bot_style", "savage roast")).strip(),
-        "notes": str(obj.get("notes", user_text)).strip(),
+        "nickname": short(obj.get("nickname", ""), 40),
+        "relation": short(obj.get("relation", ""), 40),
+        "tags": short(obj.get("tags", ""), 50),
+        "inside_jokes": short(obj.get("inside_jokes", ""), 50),
+        "bot_style": "savage roast",
+        "notes": short(obj.get("notes", ""), 60),
     }
 
 
 def savage_fallback_reply(user_text: str, member: str, data: Dict[str, Any]) -> str:
     target = detect_member_in_text(user_text, data) or member
     saved_memory = get_member_memory(target)
-    memory = f" ({saved_memory})" if saved_memory else ""
+
+    if saved_memory:
+        memory = saved_memory.split(",")[0].strip()
+        memory = f" — {memory}" if memory else ""
+    else:
+        memory = ""
 
     templates = [
-        "{target} নিয়ে আবার বিচারসভা বসছে নাকি? 😏{memory} — এই কেসটা শুরু থেকেই suspicious 😂",
-        "{target}? নাম শুনলেই মনে হয় শান্তি শেষ, drama শুরু 😭😂{memory}",
-        "ওই {target} তো আলাদা লেভেলের character ভাই 😏{memory} handle করতে গেলে patience লাগে 😂",
-        "{target} কে নিয়ে বেশি serious হয়ো না—ওর system update আগে দরকার 😂{memory}",
-        "আরে {target} আবার কী কাণ্ড করলো? 😏{memory} দেখেই মনে হচ্ছে আজকে roast ready 😂",
+        "{target} আবার scene-এ? 😏{memory} এই character-এর জন্য আলাদা warning label লাগে 😂",
+        "{target} নাম শুনলেই মনে হয় শান্তি logout, drama login 😭😂{memory}",
+        "ওই {target} তো full suspicious package 😏{memory} handle করতে গেলে patience লাগে 😂",
+        "{target} কে serious নিও না ভাই, ওর system-এ bug আগে থেকেই আছে 😂{memory}",
+        "আবার {target} নিয়ে কাহিনি? 😏{memory} এই case তো roast-ready 😂",
     ]
 
     msg = random.choice(templates).format(target=target, memory=memory)
-    return re.sub(r"\s+", " ", msg).strip()
+    return re.sub(r"\s+", " ", msg).strip()[:260]
 
 
 def ai_chat_reply(user_text: str, member: str, data: Dict[str, Any]) -> Optional[str]:
     notes = get_personality_notes()
     members = ", ".join(get_member_names(data))
     prompt = f"""
-তুমি একটি Telegram market হিসাব bot, কিন্তু তোমার personality close friend group-এর savage roaster।
+তুমি close friend Telegram group-এর savage roaster bot।
 
-Style:
-- সব reply বাংলা বা Banglish mixed natural style-এ।
-- Roast mood VERY HIGH: witty, savage, funny, দুষ্টু, বন্ধুসুলভ।
-- Fixed template ব্যবহার করবে না; প্রতিবার নতুনভাবে উত্তর দিবে।
-- Stored memory/inside joke থাকলে ব্যবহার করবে, কিন্তু বানিয়ে বলবে না।
-- religion, race, health, body, family নিয়ে hard insult করবে না।
-- explicit গালি/অশ্লীলতা avoid করবে; কিন্তু sharp খোঁচা দিবে।
-- Reply ১-২ লাইনের মধ্যে MAX।
+কঠোর নিয়ম:
+- শুধু ১টা short savage reply দিবে।
+- কোনো report না।
 - কোনো explanation না।
-- কোনো list না।
-- কোনো analysis না।
-- কোনো memory dump না।
-- Market/accounting data না থাকলে বানিয়ে বলবে না।
+- কোনো JSON না।
+- কোনো bracket/parenthesis না।
+- nickname, relation, tags, inside_jokes, notes এই শব্দগুলো reply-তে লেখা যাবে না।
+- Stored memory থাকলে শুধু joke হিসেবে ব্যবহার করবে, data dump করবে না।
+- reply হবে বাংলা/Banglish natural style।
+- ১ লাইনের বেশি না।
+- religion/race/health/body/family নিয়ে hard insult না।
+- explicit গালি না, কিন্তু sharp খোঁচা দিবে।
 
 Known members: {members}
 Current user: {member}
-Stored memory:
+Memory for context only, never repeat as data:
 {notes}
 
-User message:
-{user_text}
+User message: {user_text}
 
-শুধু direct savage reply দাও:
+Only one savage reply:
 """
-    return gemini_call(prompt, max_tokens=120, temperature=1.15)
+    return gemini_call(prompt, max_tokens=80, temperature=1.2)
+
+
+def clean_ai_reply(ai: str) -> Optional[str]:
+    if not ai:
+        return None
+
+    bad_words = [
+        "nickname", "relation", "inside joke", "inside_joke", "inside_jokes",
+        "notes", "tags", "bot_style", "stored memory", "memory", "json",
+        "নোট", "রিলেশন", "ডাকনাম"
+    ]
+
+    text = ai.replace("```", "").strip()
+    text = re.sub(r"\([^)]*(nickname|relation|inside|notes|tags|memory|ডাকনাম|নোট)[^)]*\)", "", text, flags=re.I)
+    text = re.sub(r"\{.*?\}", "", text, flags=re.S)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if any(w.lower() in text.lower() for w in bad_words):
+        return None
+
+    if ":" in text and any(k in text.lower() for k in ["nickname", "relation", "notes", "inside"]):
+        return None
+
+    return text[:260] if text else None
 
 
 def final_chat_reply(user_text: str, member: str, data: Dict[str, Any]) -> str:
     ai = ai_chat_reply(user_text, member, data)
-    if ai and "AI reply" not in ai:
-        ai = ai.strip()
-        ai = ai.replace("```", "").strip()
-        lines = [line.strip() for line in ai.splitlines() if line.strip()]
-        if lines:
-            return lines[0][:260]
+    cleaned = clean_ai_reply(ai or "")
+    if cleaned:
+        return cleaned
     return savage_fallback_reply(user_text, member, data)
 
 # =========================================================
