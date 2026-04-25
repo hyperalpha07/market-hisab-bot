@@ -780,7 +780,9 @@ If there is no useful memory, return:
 Rules:
 - Do not invent.
 - name must be one known member.
+- Keep nickname short.
 - Keep inside_jokes short.
+- Keep notes short. Do not copy the whole message.
 """
     out = gemini_call(prompt, max_tokens=170, temperature=0.1)
     obj = extract_json_object(out or "")
@@ -802,16 +804,18 @@ Rules:
 
 def savage_fallback_reply(user_text: str, member: str, data: Dict[str, Any]) -> str:
     target = detect_member_in_text(user_text, data) or member
-    memory = get_member_memory(target)
-    # Generic savage lines. No member-specific saved data is hardcoded here.
+    saved_memory = get_member_memory(target)
+    memory = f" ({saved_memory})" if saved_memory else ""
+
     templates = [
-        "{target} নিয়ে আবার কোর্ট বসছে নাকি? 😏 {memory} — এই কেসটা তো already suspicious লাগে 😂",
-        "{target}? নাম শুনলেই মনে হয় আজকে শান্তি শেষ, drama শুরু 😭😂 {memory}",
-        "ওই {target} তো আলাদা লেভেলের character ভাই 😏 {memory} — সাবধানে handle করো, না হলে নিজেই bug হয়ে যাবে 😂",
-        "{target} এর ব্যাপারে বেশি বললে bot-এরও লজ্জা লাগবে 😭 কিন্তু হ্যাঁ, vibe টা পুরো savage material 😂 {memory}",
-        "আরে {target} কে নিয়ে বেশি serious হয়ো না—ওর system update লাগে আগে 😂 {memory}",
+        "{target} নিয়ে আবার বিচারসভা বসছে নাকি? 😏{memory} — এই কেসটা শুরু থেকেই suspicious 😂",
+        "{target}? নাম শুনলেই মনে হয় শান্তি শেষ, drama শুরু 😭😂{memory}",
+        "ওই {target} তো আলাদা লেভেলের character ভাই 😏{memory} handle করতে গেলে patience লাগে 😂",
+        "{target} কে নিয়ে বেশি serious হয়ো না—ওর system update আগে দরকার 😂{memory}",
+        "আরে {target} আবার কী কাণ্ড করলো? 😏{memory} দেখেই মনে হচ্ছে আজকে roast ready 😂",
     ]
-    msg = random.choice(templates).format(target=target, memory=(memory if memory else ""))
+
+    msg = random.choice(templates).format(target=target, memory=memory)
     return re.sub(r"\s+", " ", msg).strip()
 
 
@@ -819,16 +823,20 @@ def ai_chat_reply(user_text: str, member: str, data: Dict[str, Any]) -> Optional
     notes = get_personality_notes()
     members = ", ".join(get_member_names(data))
     prompt = f"""
-তুমি একটি Telegram market হিসাব bot, কিন্তু তোমার personality close friend group-এর savage roaster.
+তুমি একটি Telegram market হিসাব bot, কিন্তু তোমার personality close friend group-এর savage roaster।
 
 Style:
 - সব reply বাংলা বা Banglish mixed natural style-এ।
-- Roast mood HIGH: witty, savage, funny, দুষ্টু, বন্ধুসুলভ।
+- Roast mood VERY HIGH: witty, savage, funny, দুষ্টু, বন্ধুসুলভ।
 - Fixed template ব্যবহার করবে না; প্রতিবার নতুনভাবে উত্তর দিবে।
 - Stored memory/inside joke থাকলে ব্যবহার করবে, কিন্তু বানিয়ে বলবে না।
 - religion, race, health, body, family নিয়ে hard insult করবে না।
 - explicit গালি/অশ্লীলতা avoid করবে; কিন্তু sharp খোঁচা দিবে।
-- Reply 1-4 লাইনের মধ্যে।
+- Reply ১-২ লাইনের মধ্যে MAX।
+- কোনো explanation না।
+- কোনো list না।
+- কোনো analysis না।
+- কোনো memory dump না।
 - Market/accounting data না থাকলে বানিয়ে বলবে না।
 
 Known members: {members}
@@ -839,15 +847,19 @@ Stored memory:
 User message:
 {user_text}
 
-এখন শুধু reply দাও। কোনো JSON না।
+শুধু direct savage reply দাও:
 """
-    return gemini_call(prompt, max_tokens=200, temperature=1.05)
+    return gemini_call(prompt, max_tokens=120, temperature=1.15)
 
 
 def final_chat_reply(user_text: str, member: str, data: Dict[str, Any]) -> str:
     ai = ai_chat_reply(user_text, member, data)
     if ai and "AI reply" not in ai:
-        return ai.strip()
+        ai = ai.strip()
+        ai = ai.replace("```", "").strip()
+        lines = [line.strip() for line in ai.splitlines() if line.strip()]
+        if lines:
+            return lines[0][:260]
     return savage_fallback_reply(user_text, member, data)
 
 # =========================================================
@@ -871,8 +883,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🆔 Your Telegram ID: {update.effective_user.id}")
-
-
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await get_cached_data(force=True)
