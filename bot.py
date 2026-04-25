@@ -1,5 +1,10 @@
-# FINAL CLEAN BOT.PY
-# Market Hisab Bot + AI Bangla Chat + Bazar Assistant + Need List + Auto Memory Roast Mode
+# Market Hisab Bot - Clean V2
+# Features:
+# - Existing wallet/summary/low scanner
+# - User-confirmed bazar submit -> admin approve -> Bazar_Entry
+# - User-confirmed need list -> admin approve -> Need_List
+# - Gemini AI chat reply, no hardcoded roast messages
+# - Auto memory learning into User_Personality when users talk about members
 
 import os
 import json
@@ -15,9 +20,6 @@ from google.oauth2.service_account import Credentials
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# =========================================================
-# ENV
-# =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
@@ -30,10 +32,8 @@ ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "").strip()
 
 AI_ENABLED = os.getenv("AI_ENABLED", "false").strip().lower() == "true"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest").strip()
 
-# =========================================================
-# SHEETS
-# =========================================================
 SETTINGS_SHEET = "Settings"
 BAZAR_SHEET = "Bazar_Entry"
 PAYMENT_SHEET = "Payment_Entry"
@@ -65,9 +65,8 @@ processed_bazar_rows = set()
 processed_payment_rows = set()
 repair_mode = False
 
-user_pending_bazar: Dict[str, Dict[str, Any]] = {}
-# Memory auto-save: no confirmation template; bot learns only when users talk about someone
-last_person_context: Dict[str, str] = {}
+# User-side pending confirmations only. Restart হলে pending clear হয়ে যাবে, তাই user আবার message দিলেই হবে.
+user_pending: Dict[str, Dict[str, Any]] = {}
 
 BN_ITEM_MAP = {
     "chal": "চাল", "cal": "চাল", "rice": "চাল",
@@ -86,21 +85,15 @@ BN_ITEM_MAP = {
     "sobji": "সবজি", "sabji": "সবজি", "torkari": "তরকারি",
 }
 
-NAME_MAP = {
-    "alpha": "ALPHA", "আলফা": "ALPHA", "alfa": "ALPHA",
-    "surjo": "SURJO", "surjo": "SURJO", "সূর্য": "SURJO", "surjo": "SURJO",
-    "mony": "MONY", "money": "MONY", "মনি": "MONY",
-    "alon": "ALON", "আলন": "ALON", "alon": "ALON",
-}
 
-# =========================================================
-# BASIC HELPERS
-# =========================================================
 def require_env() -> None:
     missing = []
-    if not BOT_TOKEN: missing.append("BOT_TOKEN")
-    if not SPREADSHEET_ID: missing.append("SPREADSHEET_ID")
-    if not GOOGLE_SERVICE_ACCOUNT_JSON: missing.append("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not SPREADSHEET_ID:
+        missing.append("SPREADSHEET_ID")
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        missing.append("GOOGLE_SERVICE_ACCOUNT_JSON")
     if missing:
         raise RuntimeError("Missing Railway variables: " + ", ".join(missing))
 
@@ -120,10 +113,7 @@ def today_str() -> str:
 def parse_amount(value: Any) -> float:
     if value is None:
         return 0.0
-    s = str(value).strip()
-    if not s:
-        return 0.0
-    cleaned = "".join(ch for ch in s if ch.isdigit() or ch in ".-")
+    cleaned = "".join(ch for ch in str(value).strip() if ch.isdigit() or ch in ".-")
     try:
         return float(cleaned) if cleaned else 0.0
     except ValueError:
@@ -146,9 +136,7 @@ def row_value(row: List[Any], index: int) -> str:
 
 
 def month_from_date(value: Any) -> str:
-    if value is None:
-        return ""
-    s = str(value).strip()
+    s = str(value or "").strip()
     if not s:
         return ""
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m"):
@@ -163,8 +151,7 @@ def month_from_date(value: Any) -> str:
 
 def get_service_account_email() -> str:
     try:
-        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        return info.get("client_email", "")
+        return json.loads(GOOGLE_SERVICE_ACCOUNT_JSON).get("client_email", "")
     except Exception:
         return ""
 
@@ -176,13 +163,14 @@ def get_admin_ids() -> List[str]:
 def is_admin(user_id: Any) -> bool:
     return str(user_id).strip() in get_admin_ids()
 
-# =========================================================
-# GOOGLE SHEET
-# =========================================================
+
 def get_gspread_client():
     require_env()
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
 
@@ -192,13 +180,11 @@ def get_spreadsheet():
 
 
 def safe_update_cell(sheet_name: str, row: int, col: int, value: str) -> None:
-    sh = get_spreadsheet().worksheet(sheet_name)
-    sh.update_cell(row, col, value)
+    get_spreadsheet().worksheet(sheet_name).update_cell(row, col, value)
 
 
 def append_row(sheet_name: str, values: List[Any]) -> None:
-    sh = get_spreadsheet().worksheet(sheet_name)
-    sh.append_row(values, value_input_option="USER_ENTERED")
+    get_spreadsheet().worksheet(sheet_name).append_row(values, value_input_option="USER_ENTERED")
 
 
 def get_sheet_rows(sheet_name: str) -> List[List[str]]:
@@ -206,26 +192,6 @@ def get_sheet_rows(sheet_name: str) -> List[List[str]]:
         return get_spreadsheet().worksheet(sheet_name).get_all_values()
     except Exception:
         return []
-
-
-def ensure_extra_sheets() -> None:
-    ss = get_spreadsheet()
-    existing = {w.title for w in ss.worksheets()}
-    headers = {
-        PENDING_BAZAR_SHEET: ["ID", "DateTime", "User ID", "Member", "Raw Message", "Items", "Total", "Status", "Admin Status", "Final Row", "Note"],
-        NEED_LIST_SHEET: ["ID", "DateTime", "User ID", "Member", "Item", "Status", "Bought By", "Bought Date", "Source Message", "Note"],
-        USER_PERSONALITY_SHEET: ["User ID", "Name", "Nickname", "Relation", "Tags", "Inside Jokes", "Bot Style", "Notes", "Last Updated"],
-        BOT_CHAT_LOG_SHEET: ["DateTime", "User ID", "Member", "Message", "Bot Reply", "Type", "Status"],
-    }
-    for title, header in headers.items():
-        if title not in existing:
-            ws = ss.add_worksheet(title=title, rows=200, cols=max(len(header), 10))
-            ws.append_row(header, value_input_option="USER_ENTERED")
-        else:
-            ws = ss.worksheet(title)
-            first = ws.row_values(1)
-            if not first:
-                ws.append_row(header, value_input_option="USER_ENTERED")
 
 
 def load_all_data_from_google() -> Dict[str, Any]:
@@ -295,9 +261,7 @@ async def get_cached_data(force: bool = False) -> Dict[str, Any]:
 async def refresh_cache() -> Dict[str, Any]:
     return await get_cached_data(force=True)
 
-# =========================================================
-# HISAB
-# =========================================================
+
 def get_wallet_status(wallet: float, threshold: float) -> str:
     if wallet < 0:
         return "NEGATIVE"
@@ -310,7 +274,15 @@ def build_stats_from_rows(data: Dict[str, Any]) -> Dict[str, Any]:
     month_key = data["selected_month"]
     threshold = data["low_threshold"]
     members = data["member_map"]
-    stats = {"month": month_key, "threshold": threshold, "total_topup": 0.0, "total_expense": 0.0, "share_per_head": 0.0, "total_wallet_left": 0.0, "members": {}}
+    stats = {
+        "month": month_key,
+        "threshold": threshold,
+        "total_topup": 0.0,
+        "total_expense": 0.0,
+        "share_per_head": 0.0,
+        "total_wallet_left": 0.0,
+        "members": {},
+    }
 
     for name in members:
         stats["members"][name] = {"topup": 0.0, "own_expense": 0.0, "share_deduction": 0.0, "wallet": 0.0, "status": "OK"}
@@ -343,15 +315,17 @@ def build_stats_from_rows(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def get_member_name_by_user_id(data: Dict[str, Any], user_id: Any) -> Optional[str]:
-    user_id = str(user_id).strip()
-    for name, uid in data["member_map"].items():
-        if str(uid).strip() == user_id:
+    uid = str(user_id).strip()
+    for name, saved_uid in data["member_map"].items():
+        if str(saved_uid).strip() == uid:
             return name
     return None
 
-# =========================================================
-# MESSAGE BUILDERS
-# =========================================================
+
+def get_member_names(data: Dict[str, Any]) -> List[str]:
+    return list(data.get("member_map", {}).keys()) or ["ALPHA", "SURJO", "MONY", "ALON"]
+
+
 def build_help_message() -> str:
     return (
         "👋 Market Hisab Bot\n\n"
@@ -369,12 +343,14 @@ def build_help_message() -> str:
         "/repair_off - Repair mode OFF\n"
         "/status - Bot status\n"
         "/approve ID - Pending bazar approve\n"
-        "/reject ID - Pending bazar reject\n\n"
+        "/reject ID - Pending bazar reject\n"
+        "/needapprove ID - Need item approve\n"
+        "/needreject ID - Need item reject\n\n"
         "💬 Examples:\n"
         "চাল শেষ ডাল শেষ তেল শেষ\n"
         "আলু 128 পানি 24 চাল 450 ডাল 127 মাছ 1200\n"
         "Alon amar mama, se chitar\n\n"
-        f"🔧 Repair Mode: {'ON 🔧' if repair_mode else 'OFF ✅'}\n"
+        f"🔧 Repair Mode: {'ON' if repair_mode else 'OFF'} {'🔧' if repair_mode else '✅'}\n"
         f"🤖 AI Chat: {'ON 🤖' if AI_ENABLED and GEMINI_API_KEY else 'OFF'}"
     )
 
@@ -385,7 +361,8 @@ def build_wallet_message(member_name: str, stats: Dict[str, Any]) -> str:
         return "❌ Wallet data পাওয়া যায়নি।"
     return (
         "💼 MY WALLET STATUS\n\n"
-        f"👤 Member: {member_name}\n📅 Month: {stats['month']}\n"
+        f"👤 Member: {member_name}\n"
+        f"📅 Month: {stats['month']}\n"
         f"➕ Top-up: {format_lkr(m['topup'])} LKR\n"
         f"🛒 Own Bazar: {format_lkr(m['own_expense'])} LKR\n"
         f"👥 Monthly Share: {format_lkr(m['share_deduction'])} LKR\n"
@@ -406,7 +383,7 @@ def build_summary_message(stats: Dict[str, Any]) -> str:
         f"💼 Total Wallet Left: {format_lkr(stats['total_wallet_left'])} LKR\n\n"
     )
     for name, m in stats["members"].items():
-        msg += f"👤 {name}\n➕ Top-up: {format_lkr(m['topup'])} LKR\n🛒 Own Bazar: {format_lkr(m['own_expense'])} LKR\n👥 Share: {format_lkr(m['share_deduction'])} LKR\n💰 Wallet: {format_lkr(m['wallet'])} LKR\n📌 Status: {m['status']}\n\n"
+        msg += f"👤 {name}: Top-up {format_lkr(m['topup'])}, Own {format_lkr(m['own_expense'])}, Wallet {format_lkr(m['wallet'])}, {m['status']}\n"
     return msg
 
 
@@ -417,8 +394,7 @@ def build_low_wallet_list(stats: Dict[str, Any]) -> str:
     for name, m in stats["members"].items():
         if m["wallet"] < threshold:
             found = True
-            suggested = threshold - m["wallet"]
-            msg += f"👤 {name}\n💸 Wallet: {format_lkr(m['wallet'])} LKR\n💳 Suggested Top-up: {format_lkr(suggested)} LKR\n📌 Status: {m['status']}\n\n"
+            msg += f"👤 {name}\n💸 Wallet: {format_lkr(m['wallet'])} LKR\n💳 Suggested Top-up: {format_lkr(threshold - m['wallet'])} LKR\n📌 Status: {m['status']}\n\n"
     if not found:
         msg += "✅ এখন কোনো low wallet member নেই।"
     return msg
@@ -428,29 +404,36 @@ def build_bazar_message(entry: Dict[str, Any], stats: Dict[str, Any], member_nam
     m = stats["members"].get(member_name, {"wallet": 0, "status": "OK"})
     return (
         "🛒 BAZAR UPDATE\n\n"
-        f"👤 Buyer: {entry['buyer']}\n📅 Date: {entry['date']}\n🧾 Type: {entry['type']}\n"
-        f"💰 Total Expense: {format_lkr(entry['total'])} LKR\n👥 Per Person Share: {format_lkr(entry['share'])} LKR\n\n"
-        f"👷 Your Name: {member_name}\n💼 Your Wallet Now: {format_lkr(m['wallet'])} LKR\n📌 Status: {m['status']}\n\n"
-        f"📊 Month Total Expense: {format_lkr(stats['total_expense'])} LKR\n💼 Total Wallet Left: {format_lkr(stats['total_wallet_left'])} LKR"
+        f"👤 Buyer: {entry['buyer']}\n"
+        f"📅 Date: {entry['date']}\n"
+        f"🧾 Type: {entry['type']}\n"
+        f"💰 Total Expense: {format_lkr(entry['total'])} LKR\n"
+        f"👥 Per Person Share: {format_lkr(entry['share'])} LKR\n\n"
+        f"👷 Your Name: {member_name}\n"
+        f"💼 Your Wallet Now: {format_lkr(m['wallet'])} LKR\n"
+        f"📌 Status: {m['status']}\n\n"
+        f"📊 Month Total Expense: {format_lkr(stats['total_expense'])} LKR\n"
+        f"💼 Total Wallet Left: {format_lkr(stats['total_wallet_left'])} LKR"
     )
 
 
 def build_payment_message(entry: Dict[str, Any], wallet_now: float, threshold: float) -> str:
     return (
         "💳 WALLET TOP-UP / ADJUSTMENT\n\n"
-        f"👤 Member: {entry['member']}\n📅 Date: {entry['date']}\n➕ Amount: {format_lkr(entry['amount'])} LKR\n"
-        f"📦 Type: {entry['type']}\n📝 Note: {entry['note']}\n\n"
-        f"💼 Your Wallet Now: {format_lkr(wallet_now)} LKR\n📌 Status: {get_wallet_status(wallet_now, threshold)}"
+        f"👤 Member: {entry['member']}\n"
+        f"📅 Date: {entry['date']}\n"
+        f"➕ Amount: {format_lkr(entry['amount'])} LKR\n"
+        f"📦 Type: {entry['type']}\n"
+        f"📝 Note: {entry['note']}\n\n"
+        f"💼 Your Wallet Now: {format_lkr(wallet_now)} LKR\n"
+        f"📌 Status: {get_wallet_status(wallet_now, threshold)}"
     )
 
 
 def build_low_wallet_personal(member: str, wallet: float, status: str, threshold: float) -> str:
-    suggested = threshold - wallet if wallet < threshold else 0
-    return f"⚠️ LOW WALLET ALERT\n\n👤 Member: {member}\n💸 Current Wallet: {format_lkr(wallet)} LKR\n💳 Suggested Top-up: {format_lkr(suggested)} LKR\n📌 Status: {status}"
+    return f"⚠️ LOW WALLET ALERT\n\n👤 Member: {member}\n💸 Current Wallet: {format_lkr(wallet)} LKR\n💳 Suggested Top-up: {format_lkr(threshold - wallet)} LKR\n📌 Status: {status}"
 
-# =========================================================
-# PARSERS
-# =========================================================
+
 def bangla_item(word: str) -> str:
     return BN_ITEM_MAP.get(word.strip().lower(), word.strip())
 
@@ -460,7 +443,7 @@ def normalize_items_text(text: str) -> str:
     cleaned = []
     for p in parts:
         p = p.strip()
-        if p:
+        if p and not re.fullmatch(r"\d+(?:\.\d+)?", p):
             cleaned.append(bangla_item(p))
     return ", ".join(dict.fromkeys(cleaned))
 
@@ -495,13 +478,14 @@ def parse_need_list_text(text: str) -> List[str]:
     need_words = ["শেষ", "ses", "shesh", "নেই", "nai", "ফুরিয়ে", "ফুরাইছে"]
     if not any(w in low for w in need_words):
         return []
+
     cleaned = low
     for w in need_words:
         cleaned = cleaned.replace(w, " ")
     cleaned = re.sub(r"[^\w\u0980-\u09FF\s,]", " ", cleaned)
     parts = re.split(r"[,\s]+", cleaned)
+    ignore = {"ajke", "aaj", "আজকে", "আজ", "amader", "আমাদের", "ar", "আর", "o", "ও", "ta", "টা", "ki", "কি", "hobe", "হবে", "kinte", "কিনতে"}
     items = []
-    ignore = {"ajke", "aaj", "আজকে", "আজ", "amader", "আমাদের", "ar", "আর", "o", "ও", "ta", "টা"}
     for p in parts:
         p = p.strip()
         if not p or p in ignore:
@@ -512,12 +496,10 @@ def parse_need_list_text(text: str) -> List[str]:
     return items
 
 
-def generate_id(prefix: str = "BZ") -> str:
+def generate_id(prefix: str) -> str:
     return f"{prefix}{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
-# =========================================================
-# AUTO MEMORY + PERSONALITY
-# =========================================================
+
 def get_personality_rows() -> List[List[str]]:
     return get_sheet_rows(USER_PERSONALITY_SHEET)
 
@@ -527,14 +509,11 @@ def get_personality_notes() -> str:
     notes = []
     for row in rows[1:]:
         name = row_value(row, 1)
-        nickname = row_value(row, 2)
-        relation = row_value(row, 3)
-        tags = row_value(row, 4)
-        jokes = row_value(row, 5)
-        style = row_value(row, 6)
-        note = row_value(row, 7)
-        if name:
-            notes.append(f"{name}: ডাকনাম={nickname}, সম্পর্ক={relation}, ট্যাগ={tags}, ভিতরের মজা={jokes}, স্টাইল={style}, নোট={note}")
+        if not name:
+            continue
+        notes.append(
+            f"{name}: nickname={row_value(row, 2)}, relation={row_value(row, 3)}, tags={row_value(row, 4)}, inside_jokes={row_value(row, 5)}, bot_style={row_value(row, 6)}, notes={row_value(row, 7)}"
+        )
     return "\n".join(notes[:30])
 
 
@@ -545,137 +524,36 @@ def save_chat_log(user_id: str, member: str, message: str, reply: str, typ: str,
         print("Chat log save failed:", exc)
 
 
-def find_target_name(text: str, uid: str = "") -> str:
-    low = text.lower()
-    for key, val in NAME_MAP.items():
-        if key in low:
-            if uid:
-                last_person_context[uid] = val
-            return val
-
-    # If user says "tar nickname..." after mentioning a person, continue that context
-    if uid and uid in last_person_context:
-        pronoun_markers = ["tar", "তার", "take", "ওকে", "or", "ওর", "se ", "সে "]
-        if any(m in low for m in pronoun_markers):
-            return last_person_context[uid]
-
-    return ""
-
-
-def extract_after_patterns(text: str, patterns: List[str]) -> str:
-    raw = text.strip()
-    low = raw.lower()
-    for pat in patterns:
-        m = re.search(pat, low, flags=re.I)
-        if m:
-            return m.group(1).strip(" .,!।")[:60]
-    return ""
-
-
-def detect_memory_text(text: str, speaker_member: str, uid: str = "") -> Optional[Dict[str, str]]:
-    raw = text.strip()
-    low = raw.lower()
-    target = find_target_name(raw, uid)
-    if not target:
-        return None
-
-    memory_keywords = [
-        "amar", "amr", "আমার", "mama", "মামা", "vai", "ভাই", "friend", "bondhu", "বন্ধু",
-        "nickname", "nick name", "ডাকনাম", "nam hobe", "name hobe", "hobe", "হবে", "holo", "হলো",
-        "chitar", "cheater", "চিটার", "valo", "ভালো", "kharap", "খারাপ", "smart", "lazy", "লেজি", "boka", "বোকা",
-        "hutas", "hutase", "হুটাস", "হুটাসে", "nator", "drama", "নাটক", "boss", "admin"
-    ]
-    if not any(k in low for k in memory_keywords):
-        return None
-
-    relation = ""
-    nickname = ""
-    tags = []
-    inside_jokes = []
-    bot_style = "roast বেশি, মজা করে reply"
-
-    if "mama" in low or "মামা" in low:
-        relation = f"{speaker_member}-এর মামা"
-        tags.append("mama")
-    if "vai" in low or "ভাই" in low:
-        relation = relation or f"{speaker_member}-এর ভাই/বন্ধু"
-    if "friend" in low or "bondhu" in low or "বন্ধু" in low:
-        relation = relation or "বন্ধু"
-
-    nick = extract_after_patterns(raw, [
-        r"nickname\s*(?:hobe|holo|is|=)\s*([^.,।!]+)",
-        r"nick\s*name\s*(?:hobe|holo|is|=)\s*([^.,।!]+)",
-        r"ডাকনাম\s*(?:হবে|হলো|=)\s*([^.,।!]+)",
-        r"নাম\s*(?:হবে|হলো|=)\s*([^.,।!]+)",
-    ])
-    if nick:
-        nickname = nick
-        inside_jokes.append(nick)
-        tags.append("nickname")
-
-    if "chitar" in low or "cheater" in low or "চিটার" in low:
-        if not nickname:
-            nickname = "চিটার মামা" if ("mama" in low or "মামা" in low or "মামা" in relation) else "চিটার"
-        inside_jokes.append("চিটার")
-        tags.append("roast")
-    if "hutase" in low or "hutas" in low or "হুটাস" in low or "হুটাসে" in low:
-        if not nickname:
-            nickname = "হুটাসে চলে"
-        inside_jokes.append("হুটাসে চলে")
-        tags.append("inside-joke")
-    if "smart" in low:
-        tags.append("smart")
-    if "lazy" in low or "লেজি" in low:
-        tags.append("lazy")
-    if "drama" in low or "নাটক" in low:
-        tags.append("drama")
-        inside_jokes.append("নাটক করে")
-    if "boss" in low or "admin" in low:
-        tags.append("boss")
-        bot_style = "respect+fun+roast"
-    if "valo" in low or "ভালো" in low:
-        tags.append("good")
-    if "kharap" in low or "খারাপ" in low:
-        tags.append("roast")
-
-    return {
-        "name": target,
-        "nickname": nickname,
-        "relation": relation,
-        "tags": ",".join(dict.fromkeys(tags)),
-        "inside_jokes": ", ".join(dict.fromkeys(inside_jokes)),
-        "bot_style": bot_style,
-        "notes": raw,
-    }
-
-
-def merge_old(old: str, new: str) -> str:
-    old = str(old or "").strip()
-    new = str(new or "").strip()
-    if not new:
-        return old
-    if not old:
-        return new
-    if new.lower() in old.lower():
-        return old
-    return old + ", " + new
-
-
-def upsert_user_personality(memory: Dict[str, str]) -> None:
-    ss = get_spreadsheet()
-    sh = ss.worksheet(USER_PERSONALITY_SHEET)
+def upsert_user_personality(memory: Dict[str, str], data: Dict[str, Any]) -> None:
+    if not memory or not memory.get("name"):
+        return
+    sh = get_spreadsheet().worksheet(USER_PERSONALITY_SHEET)
     rows = sh.get_all_values()
-    name = memory["name"].strip().upper()
-    now_date = datetime.now().strftime("%Y-%m-%d")
+    member_map = data.get("member_map", {})
+    name = normalize_name(memory.get("name"))
+    user_id = member_map.get(name, "")
+    now_date = today_str()
+
+    def merge_old(old: str, new: str) -> str:
+        old = str(old or "").strip()
+        new = str(new or "").strip()
+        if not new:
+            return old
+        if not old:
+            return new
+        if new.lower() in old.lower():
+            return old
+        return old + ", " + new
 
     target_row = None
     for idx, row in enumerate(rows[1:], start=2):
-        if row_value(row, 1).upper() == name:
+        if normalize_name(row_value(row, 1)) == name:
             target_row = idx
             break
 
     if target_row:
         old = rows[target_row - 1]
+        sh.update_cell(target_row, 1, row_value(old, 0) or user_id)
         sh.update_cell(target_row, 3, merge_old(row_value(old, 2), memory.get("nickname", "")))
         sh.update_cell(target_row, 4, merge_old(row_value(old, 3), memory.get("relation", "")))
         sh.update_cell(target_row, 5, merge_old(row_value(old, 4), memory.get("tags", "")))
@@ -685,54 +563,25 @@ def upsert_user_personality(memory: Dict[str, str]) -> None:
         sh.update_cell(target_row, 9, now_date)
     else:
         sh.append_row([
-            "", name, memory.get("nickname", ""), memory.get("relation", ""), memory.get("tags", ""),
-            memory.get("inside_jokes", ""), memory.get("bot_style", ""), memory.get("notes", ""), now_date
+            user_id,
+            name,
+            memory.get("nickname", ""),
+            memory.get("relation", ""),
+            memory.get("tags", ""),
+            memory.get("inside_jokes", ""),
+            memory.get("bot_style", ""),
+            memory.get("notes", ""),
+            now_date,
         ], value_input_option="USER_ENTERED")
 
 
-def safe_fun_reply(text: str, member: str) -> str:
-    t = text.lower()
-    if "alon" in t or "আলন" in t:
-        return "আলন মামার কথা বলছো? ওইটা তো আমাদের গ্রুপের VIP চিটার 😂 তবে মানুষটা মন্দ না, শুধু চালাকি একটু বেশি 😏"
-    if "surjo" in t or "সূর্য" in t:
-        return "সূর্য ভাই মানে আলো আছে, কিন্তু বাজারের সময় মাঝে মাঝে মেঘ ঢেকে যায় 😂"
-    if "mony" in t or "মনি" in t:
-        return "মনি ভাই শান্ত টাইপ, কিন্তু হিসাবের সময় চুপচাপ সব দেখে রাখে 😄"
-    if "alpha" in t or "আলফা" in t:
-        return "AlphA ভাই তো এই সিস্টেমের boss 😎 বাজার, wallet, bot—সব জায়গায় control!"
-    return f"হাহাহা {member or 'ভাই'}, কথা শুনে মনে হচ্ছে আজকে গ্রুপে আবার মজা শুরু হবে 😂"
-
-
-def gemini_reply(user_text: str, member: str, personality_notes: str) -> Optional[str]:
+def gemini_call(prompt: str, max_tokens: int = 220, temperature: float = 0.9) -> Optional[str]:
     if not (AI_ENABLED and GEMINI_API_KEY):
         return None
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
-    prompt = f"""
-তুমি একটি Telegram market hisab bot, কিন্তু তুমি খাঁটি বাংলা ভাষায় বন্ধুর মতো কথা বলো।
-
-Style:
-- সব reply বাংলা ভাষায়।
-- funny, sweet, বন্ধুসুলভ, light roasting allowed।
-- ৪ জন close friend: ALPHA, SURJO, MONY, ALON।
-- তাদের saved memory/inside joke ব্যবহার করবে।
-- religion, race, health, body, family নিয়ে toxic insult করবে না।
-- reply ছোট রাখবে।
-- command বা হিসাবের fake data বানাবে না।
-- জরুরি কথা মনে হলে বলবে: "এটা একটু গুরুত্বপূর্ণ মনে হচ্ছে, চাইলে admin কে জানাতে পারি।"
-
-Current user: {member}
-
-Known friend notes:
-{personality_notes}
-
-User message:
-{user_text}
-
-এখন natural বাংলা reply দাও।
-"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 1.08, "maxOutputTokens": 180},
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
     }
     try:
         r = requests.post(url, json=payload, timeout=15)
@@ -745,17 +594,104 @@ User message:
         print("Gemini request failed:", exc)
         return None
 
-# =========================================================
-# COMMANDS
-# =========================================================
+
+def extract_json_object(text: str) -> Optional[dict]:
+    if not text:
+        return None
+    match = re.search(r"\{.*\}", text, re.S)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        return None
+
+
+def ai_extract_memory(user_text: str, speaker: str, data: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    members = ", ".join(get_member_names(data))
+    prompt = f"""
+You extract memory facts from casual Bangla/Banglish Telegram chat.
+Known members: {members}
+Speaker: {speaker}
+Message: {user_text}
+
+Return ONLY JSON. No markdown.
+If the message says a fact, nickname, relation, habit, joke, or opinion about a known member, return:
+{{"save":true,"name":"MEMBER_NAME","nickname":"","relation":"","tags":"","inside_jokes":"","bot_style":"high roast","notes":"short Bangla/Banglish note"}}
+If there is no useful memory, return:
+{{"save":false}}
+Rules:
+- Do not invent.
+- name must be one known member.
+- For nickname like "tar nickname hobe X", save X as nickname for the last mentioned/obvious member only if clear.
+- Keep inside_jokes short.
+"""
+    out = gemini_call(prompt, max_tokens=160, temperature=0.1)
+    obj = extract_json_object(out or "")
+    if not obj or not obj.get("save"):
+        return None
+    name = normalize_name(obj.get("name", ""))
+    if name not in get_member_names(data):
+        return None
+    return {
+        "name": name,
+        "nickname": str(obj.get("nickname", "")).strip(),
+        "relation": str(obj.get("relation", "")).strip(),
+        "tags": str(obj.get("tags", "")).strip(),
+        "inside_jokes": str(obj.get("inside_jokes", "")).strip(),
+        "bot_style": str(obj.get("bot_style", "high roast")).strip(),
+        "notes": str(obj.get("notes", user_text)).strip(),
+    }
+
+
+def ai_chat_reply(user_text: str, member: str, data: Dict[str, Any]) -> Optional[str]:
+    notes = get_personality_notes()
+    members = ", ".join(get_member_names(data))
+    prompt = f"""
+তুমি একটি Telegram market হিসাব bot, কিন্তু তোমার personality বন্ধুর মতো।
+
+Style:
+- সব reply বাংলা বা Banglish mixed natural style-এ।
+- Roast mood বেশি, witty, funny, দুষ্টু, বন্ধুসুলভ।
+- Fixed template ব্যবহার করবে না। প্রতিবার নতুনভাবে উত্তর দিবে।
+- Known memory/inside joke ব্যবহার করবে, কিন্তু বানিয়ে বলবে না।
+- religion, race, health, body, family নিয়ে hard insult করবে না।
+- গালি/অশ্লীলতা কম রাখবে; বন্ধুর মতো খোঁচা দিবে।
+- Reply 1-4 লাইনের মধ্যে।
+- Market/accounting data না থাকলে বানিয়ে বলবে না।
+
+Known members: {members}
+Current user: {member}
+Stored memory:
+{notes}
+
+User message:
+{user_text}
+
+এখন শুধু reply দাও। কোনো JSON না।
+"""
+    return gemini_call(prompt, max_tokens=180, temperature=1.0)
+
+
+async def send_admin(bot, text: str, data: Dict[str, Any]) -> None:
+    if not SEND_ADMIN_DETAILS:
+        return
+    group_id = data.get("admin_group_id", "")
+    if group_id:
+        await bot.send_message(chat_id=group_id, text=text)
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(build_help_message())
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(build_help_message())
 
+
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🆔 Your Telegram ID: {update.effective_user.id}")
+
 
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -764,53 +700,46 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ Google Sheet connected!\n\n"
             f"Service account:\n{get_service_account_email()}\n\n"
             f"Spreadsheet ID:\n{SPREADSHEET_ID}\n\n"
-            f"Cache TTL: {CACHE_TTL_SECONDS}s\nAuto scan: {SCAN_INTERVAL_SECONDS}s\n"
-            f"Repair Mode: {'ON' if repair_mode else 'OFF'}\nAI Enabled: {AI_ENABLED}\n\n"
+            f"Cache TTL: {CACHE_TTL_SECONDS}s\n"
+            f"Auto scan: {SCAN_INTERVAL_SECONDS}s\n"
+            f"Repair Mode: {'ON' if repair_mode else 'OFF'}\n"
+            f"AI Enabled: {AI_ENABLED}\n\n"
             "Sheets:\n- " + "\n- ".join(data["sheet_titles"])
         )
     except Exception as exc:
-        await update.message.reply_text(f"❌ Google Sheet connection failed.\n\nError:\n{type(exc).__name__}: {exc}")
+        await update.message.reply_text(f"❌ Google Sheet connection failed.\n\n{type(exc).__name__}: {exc}")
         print(traceback.format_exc())
+
 
 async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ You are not admin.")
         return
     try:
-        await asyncio.to_thread(ensure_extra_sheets)
         await refresh_cache()
-        await update.message.reply_text("✅ Sheet cache refreshed + extra sheets checked.")
+        await update.message.reply_text("✅ Sheet cache refreshed.")
     except Exception as exc:
         await update.message.reply_text(f"❌ Refresh failed:\n{type(exc).__name__}: {exc}")
-        print(traceback.format_exc())
+
 
 async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        data = await get_cached_data()
-        member = get_member_name_by_user_id(data, update.effective_user.id)
-        if not member:
-            await update.message.reply_text(f"❌ তোমার Telegram User ID member list-এ পাওয়া যায়নি।\n\nতোমার ID: {update.effective_user.id}")
-            return
-        await update.message.reply_text(build_wallet_message(member, data["stats"]))
-    except Exception as exc:
-        await update.message.reply_text(f"❌ /wallet error:\n{type(exc).__name__}: {exc}")
-        print(traceback.format_exc())
+    data = await get_cached_data()
+    member = get_member_name_by_user_id(data, update.effective_user.id)
+    if not member:
+        await update.message.reply_text(f"❌ তোমার Telegram User ID member list-এ নেই।\nতোমার ID: {update.effective_user.id}")
+        return
+    await update.message.reply_text(build_wallet_message(member, data["stats"]))
+
 
 async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        data = await get_cached_data()
-        await update.message.reply_text(build_summary_message(data["stats"]))
-    except Exception as exc:
-        await update.message.reply_text(f"❌ /summary error:\n{type(exc).__name__}: {exc}")
-        print(traceback.format_exc())
+    data = await get_cached_data()
+    await update.message.reply_text(build_summary_message(data["stats"]))
+
 
 async def low_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        data = await get_cached_data()
-        await update.message.reply_text(build_low_wallet_list(data["stats"]))
-    except Exception as exc:
-        await update.message.reply_text(f"❌ /low error:\n{type(exc).__name__}: {exc}")
-        print(traceback.format_exc())
+    data = await get_cached_data()
+    await update.message.reply_text(build_low_wallet_list(data["stats"]))
+
 
 async def repair_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global repair_mode
@@ -818,7 +747,8 @@ async def repair_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ You are not admin.")
         return
     repair_mode = True
-    await update.message.reply_text("🔧 Repair Mode ON\n\nAuto member notifications are now paused.")
+    await update.message.reply_text("🔧 Repair Mode ON")
+
 
 async def repair_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global repair_mode
@@ -826,7 +756,8 @@ async def repair_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ You are not admin.")
         return
     repair_mode = False
-    await update.message.reply_text("✅ Repair Mode OFF\n\nAuto member notifications are active again.")
+    await update.message.reply_text("✅ Repair Mode OFF")
+
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await get_cached_data()
@@ -834,39 +765,39 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 BOT STATUS\n\n"
         f"Repair Mode: {'ON 🔧' if repair_mode else 'OFF ✅'}\n"
         f"AI Chat: {'ON 🤖' if AI_ENABLED and GEMINI_API_KEY else 'OFF'}\n"
-        f"Month: {data['selected_month']}\nMembers: {len(data['member_map'])}\n"
-        f"Cache TTL: {CACHE_TTL_SECONDS}s\nAuto Scan: {SCAN_INTERVAL_SECONDS}s\n"
+        f"Month: {data['selected_month']}\n"
+        f"Members: {len(data['member_map'])}\n"
+        f"Cache TTL: {CACHE_TTL_SECONDS}s\n"
+        f"Auto Scan: {SCAN_INTERVAL_SECONDS}s\n"
         f"Admin IDs: {ADMIN_USER_IDS or 'Not set'}"
     )
 
+
 async def bazarlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        rows = await asyncio.to_thread(get_sheet_rows, NEED_LIST_SHEET)
-        pending = []
-        for row in rows[1:]:
-            item = row_value(row, 4)
-            status = row_value(row, 5).upper()
-            member = row_value(row, 3)
-            if item and status != "BOUGHT":
-                pending.append((item, member))
-        if not pending:
-            await update.message.reply_text("✅ বাজার লিস্ট এখন ফাঁকা। সবাই এত responsible কবে হলো রে ভাই? 😄")
-            return
-        msg = "🛒 দরকারি বাজার লিস্ট:\n\n"
-        for i, (item, member) in enumerate(pending, start=1):
-            msg += f"{i}. {item} — added by {member}\n"
-        msg += "\nযে বাজারে যাবে, এগুলো দেখে যেও। না হলে বাসায় বিচার বসবে 😄"
-        await update.message.reply_text(msg)
-    except Exception as exc:
-        await update.message.reply_text(f"❌ /bazarlist error:\n{type(exc).__name__}: {exc}")
+    rows = await asyncio.to_thread(get_sheet_rows, NEED_LIST_SHEET)
+    pending = []
+    for row in rows[1:]:
+        item = row_value(row, 4)
+        status = row_value(row, 5).upper()
+        member = row_value(row, 3)
+        if item and status == "PENDING":
+            pending.append((item, member))
+    if not pending:
+        await update.message.reply_text("✅ বাজার লিস্ট এখন ফাঁকা।")
+        return
+    msg = "🛒 দরকারি বাজার লিস্ট:\n\n"
+    for i, (item, member) in enumerate(pending, start=1):
+        msg += f"{i}. {item} — added by {member}\n"
+    await update.message.reply_text(msg)
+
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    if uid in user_pending_bazar:
-        user_pending_bazar.pop(uid, None)
-        await update.message.reply_text("✅ Pending বাজার cancel করা হয়েছে।")
+    if uid in user_pending:
+        user_pending.pop(uid, None)
+        await update.message.reply_text("✅ Pending কাজ cancel করা হয়েছে।")
     else:
-        await update.message.reply_text("কোনো pending কাজ নেই ভাই 😄")
+        await update.message.reply_text("কোনো pending কাজ নেই।")
 
 
 async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -878,26 +809,19 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     pending_id = context.args[0].strip()
     rows = await asyncio.to_thread(get_sheet_rows, PENDING_BAZAR_SHEET)
-    found_row = None
-    found_index = None
     for idx, row in enumerate(rows[1:], start=2):
         if row_value(row, 0) == pending_id:
-            found_row, found_index = row, idx
-            break
-    if not found_row:
-        await update.message.reply_text("❌ Pending ID পাওয়া যায়নি।")
-        return
-    if row_value(found_row, 8).upper() == "APPROVED":
-        await update.message.reply_text("এই entry already approved.")
-        return
-    member = row_value(found_row, 3)
-    items = row_value(found_row, 5)
-    total = row_value(found_row, 6)
-    await asyncio.to_thread(append_row, BAZAR_SHEET, [today_str(), member, "বাজার", total, "", items, ""])
-    await asyncio.to_thread(safe_update_cell, PENDING_BAZAR_SHEET, found_index, 9, "APPROVED")
-    await asyncio.to_thread(safe_update_cell, PENDING_BAZAR_SHEET, found_index, 10, "Added to Bazar_Entry")
-    await refresh_cache()
-    await update.message.reply_text(f"✅ Approved!\n\n👤 Buyer: {member}\n🧾 Items: {items}\n💰 Total: {format_lkr(total)} LKR\n\nএখন auto scanner আগের নিয়মে সবাইকে message পাঠাবে।")
+            if row_value(row, 8).upper() == "APPROVED":
+                await update.message.reply_text("Already approved.")
+                return
+            await asyncio.to_thread(append_row, BAZAR_SHEET, [today_str(), row_value(row, 3), "বাজার", row_value(row, 6), "", row_value(row, 5), ""])
+            await asyncio.to_thread(safe_update_cell, PENDING_BAZAR_SHEET, idx, 9, "APPROVED")
+            await asyncio.to_thread(safe_update_cell, PENDING_BAZAR_SHEET, idx, 10, "Added to Bazar_Entry")
+            await refresh_cache()
+            await update.message.reply_text(f"✅ Bazar approved: {pending_id}")
+            return
+    await update.message.reply_text("❌ Pending ID পাওয়া যায়নি।")
+
 
 async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -911,31 +835,61 @@ async def reject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for idx, row in enumerate(rows[1:], start=2):
         if row_value(row, 0) == pending_id:
             await asyncio.to_thread(safe_update_cell, PENDING_BAZAR_SHEET, idx, 9, "REJECTED")
-            await update.message.reply_text(f"❌ Rejected: {pending_id}")
+            await update.message.reply_text(f"❌ Bazar rejected: {pending_id}")
             return
     await update.message.reply_text("❌ Pending ID পাওয়া যায়নি।")
 
-# =========================================================
-# SCANNER
-# =========================================================
+
+async def needapprove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ You are not admin.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /needapprove ND20260424123456")
+        return
+    need_id = context.args[0].strip()
+    rows = await asyncio.to_thread(get_sheet_rows, NEED_LIST_SHEET)
+    for idx, row in enumerate(rows[1:], start=2):
+        if row_value(row, 0) == need_id:
+            await asyncio.to_thread(safe_update_cell, NEED_LIST_SHEET, idx, 6, "PENDING")
+            await update.message.reply_text(f"✅ Need item approved: {row_value(row, 4)}")
+            return
+    await update.message.reply_text("❌ Need ID পাওয়া যায়নি।")
+
+
+async def needreject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ You are not admin.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /needreject ND20260424123456")
+        return
+    need_id = context.args[0].strip()
+    rows = await asyncio.to_thread(get_sheet_rows, NEED_LIST_SHEET)
+    for idx, row in enumerate(rows[1:], start=2):
+        if row_value(row, 0) == need_id:
+            await asyncio.to_thread(safe_update_cell, NEED_LIST_SHEET, idx, 6, "REJECTED")
+            await update.message.reply_text(f"❌ Need item rejected: {row_value(row, 4)}")
+            return
+    await update.message.reply_text("❌ Need ID পাওয়া যায়নি।")
+
+
 def is_sent_status(value: str) -> bool:
     return "SENT" in str(value or "").upper()
+
 
 def complete_bazar_row(row: List[str]) -> bool:
     return bool(row_value(row, 0) and row_value(row, 1) and row_value(row, 2) and parse_amount(row_value(row, 3)) > 0)
 
+
 def complete_payment_row(row: List[str]) -> bool:
     return bool(row_value(row, 0) and row_value(row, 1) and parse_amount(row_value(row, 2)) > 0 and row_value(row, 3))
 
-async def send_admin(bot, text: str, data: Dict[str, Any]) -> None:
-    if not SEND_ADMIN_DETAILS:
-        return
-    group_id = data.get("admin_group_id", "")
-    if group_id:
-        await bot.send_message(chat_id=group_id, text=text)
 
 async def scan_bazar(bot, data: Dict[str, Any]) -> bool:
-    rows, stats, member_map = data["bazar_rows"], data["stats"], data["member_map"]
+    rows = data["bazar_rows"]
+    stats = data["stats"]
+    member_map = data["member_map"]
     if len(rows) < 4:
         return False
     changed = False
@@ -944,12 +898,14 @@ async def scan_bazar(bot, data: Dict[str, Any]) -> bool:
         row_key = f"bazar:{idx}:{row_value(row, 0)}:{row_value(row, 1)}:{row_value(row, 3)}"
         if row_key in processed_bazar_rows or not complete_bazar_row(row) or is_sent_status(status):
             continue
-        date, buyer, typ = row_value(row, 0), normalize_name(row_value(row, 1)), row_value(row, 2)
+        date = row_value(row, 0)
+        buyer = normalize_name(row_value(row, 1))
+        typ = row_value(row, 2)
         total = parse_amount(row_value(row, 3))
         share = parse_amount(row_value(row, 4)) or stats["share_per_head"]
         note = row_value(row, 5)
         entry = {"date": date, "buyer": buyer, "type": typ, "total": total, "share": share}
-        await send_admin(bot, f"📋 BAZAR DETAILS\n\n👤 Buyer: {buyer}\n📅 Date: {date}\n🧾 Category: {typ}\n💰 Total: {format_lkr(total)} LKR\n👥 Share: {format_lkr(share)} LKR\n📝 Note: {note}\n\n🔧 Repair Mode: {'ON' if repair_mode else 'OFF'}", data)
+        await send_admin(bot, f"📋 BAZAR DETAILS\n\n👤 Buyer: {buyer}\n📅 Date: {date}\n🧾 Category: {typ}\n💰 Total: {format_lkr(total)} LKR\n👥 Share: {format_lkr(share)} LKR\n📝 Note: {note}", data)
         success = 0
         if not repair_mode:
             for member_name, user_id in member_map.items():
@@ -965,8 +921,11 @@ async def scan_bazar(bot, data: Dict[str, Any]) -> bool:
         changed = True
     return changed
 
+
 async def scan_payment(bot, data: Dict[str, Any]) -> bool:
-    rows, stats, member_map = data["payment_rows"], data["stats"], data["member_map"]
+    rows = data["payment_rows"]
+    stats = data["stats"]
+    member_map = data["member_map"]
     if len(rows) < 4:
         return False
     changed = False
@@ -975,12 +934,15 @@ async def scan_payment(bot, data: Dict[str, Any]) -> bool:
         row_key = f"payment:{idx}:{row_value(row, 0)}:{row_value(row, 1)}:{row_value(row, 2)}"
         if row_key in processed_payment_rows or not complete_payment_row(row) or is_sent_status(status):
             continue
-        date, member = row_value(row, 0), normalize_name(row_value(row, 1))
-        amount, typ, note = parse_amount(row_value(row, 2)), row_value(row, 3), row_value(row, 4)
+        date = row_value(row, 0)
+        member = normalize_name(row_value(row, 1))
+        amount = parse_amount(row_value(row, 2))
+        typ = row_value(row, 3)
+        note = row_value(row, 4)
         user_id = member_map.get(member)
         wallet_now = stats["members"].get(member, {}).get("wallet", 0)
         entry = {"date": date, "member": member, "amount": amount, "type": typ, "note": note}
-        await send_admin(bot, f"📋 PAYMENT DETAILS\n\n👤 Member: {member}\n📅 Date: {date}\n💰 Amount: {format_lkr(amount)} LKR\n📦 Type: {typ}\n📝 Note: {note}\n💼 Wallet Now: {format_lkr(wallet_now)} LKR\n\n🔧 Repair Mode: {'ON' if repair_mode else 'OFF'}", data)
+        await send_admin(bot, f"📋 PAYMENT DETAILS\n\n👤 Member: {member}\n📅 Date: {date}\n💰 Amount: {format_lkr(amount)} LKR\n📦 Type: {typ}\n📝 Note: {note}\n💼 Wallet Now: {format_lkr(wallet_now)} LKR", data)
         if not user_id:
             await asyncio.to_thread(safe_update_cell, PAYMENT_SHEET, idx, 6, "Member user id missing")
             continue
@@ -1001,16 +963,20 @@ async def scan_payment(bot, data: Dict[str, Any]) -> bool:
             await asyncio.to_thread(safe_update_cell, PAYMENT_SHEET, idx, 6, "SEND FAILED")
     return changed
 
+
 async def scan_low_wallet(bot, data: Dict[str, Any]) -> None:
-    stats, threshold, member_map = data["stats"], data["stats"]["threshold"], data["member_map"]
+    stats = data["stats"]
+    threshold = stats["threshold"]
+    member_map = data["member_map"]
     group_id = data.get("admin_group_id", "")
     for member, m in stats["members"].items():
-        wallet, status = m["wallet"], m["status"]
+        wallet = m["wallet"]
+        status = m["status"]
         key = f"{stats['month']}:{member}"
         if wallet < threshold:
             if key in low_alert_sent_cache:
                 continue
-            group_msg = f"⚠️ LOW WALLET AUTO ALERT\n\n👤 Member: {member}\n💸 Wallet: {format_lkr(wallet)} LKR\n💳 Suggested Top-up: {format_lkr(threshold - wallet)} LKR\n📌 Status: {status}\n📉 Threshold: {format_lkr(threshold)} LKR\n\n🔧 Repair Mode: {'ON' if repair_mode else 'OFF'}"
+            group_msg = f"⚠️ LOW WALLET AUTO ALERT\n\n👤 Member: {member}\n💸 Wallet: {format_lkr(wallet)} LKR\n💳 Suggested Top-up: {format_lkr(threshold - wallet)} LKR\n📌 Status: {status}\n📉 Threshold: {format_lkr(threshold)} LKR"
             if group_id:
                 await bot.send_message(chat_id=group_id, text=group_msg)
             if SEND_LOW_PERSONAL and not repair_mode and member_map.get(member):
@@ -1018,6 +984,7 @@ async def scan_low_wallet(bot, data: Dict[str, Any]) -> None:
             low_alert_sent_cache.add(key)
         else:
             low_alert_sent_cache.discard(key)
+
 
 async def auto_scan_loop(bot):
     await asyncio.sleep(10)
@@ -1034,83 +1001,82 @@ async def auto_scan_loop(bot):
             print(traceback.format_exc())
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
 
-# =========================================================
-# NORMAL MESSAGE HANDLER
-# =========================================================
+
 async def normal_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     text = update.message.text.strip()
     uid = str(update.effective_user.id)
     data = await get_cached_data()
-    member = get_member_name_by_user_id(data, uid) or update.effective_user.first_name or "UNKNOWN"
-    member = normalize_name(member)
+    member = normalize_name(get_member_name_by_user_id(data, uid) or update.effective_user.first_name or "UNKNOWN")
     low = text.lower().strip()
 
-    # OK only confirms pending bazar. Memory is auto-saved silently and AI replies naturally.
+    # User confirmation flow. Confirmation ছাড়া sheet/admin update হবে না.
     if low in ["ok", "okay", "ওকে", "ঠিক আছে", "হ্যাঁ", "ha", "yes"]:
-        pending = user_pending_bazar.get(uid)
-        if pending:
-            pending_id = pending["id"]
-            await asyncio.to_thread(
-                append_row,
-                PENDING_BAZAR_SHEET,
-                [pending_id, now_str(), uid, member, pending["raw"], pending["items"], pending["total"], "USER_OK", "PENDING", "", pending.get("note", "")]
-            )
-            user_pending_bazar.pop(uid, None)
-            admin_msg = f"🆕 নতুন বাজার approval দরকার\n\nID: {pending_id}\n👤 Buyer: {member}\n🧾 Items: {pending['items']}\n💰 Total: {format_lkr(pending['total'])} LKR\n\nApprove করতে:\n/approve {pending_id}\n\nReject করতে:\n/reject {pending_id}"
-            await send_admin(context.bot, admin_msg, data)
-            reply = "✅ ঠিক আছে ভাই, বাজারটা admin approval-এ পাঠিয়ে দিলাম।\nAdmin approve দিলেই সবার wallet update হয়ে যাবে 😄"
+        pending = user_pending.get(uid)
+        if pending and pending.get("type") == "BAZAR":
+            p = pending
+            user_pending.pop(uid, None)
+            await asyncio.to_thread(append_row, PENDING_BAZAR_SHEET, [p["id"], now_str(), uid, member, p["raw"], p["items"], p["total"], "USER_OK", "PENDING", "", p.get("note", "")])
+            await send_admin(context.bot, f"🆕 নতুন বাজার approval দরকার\n\nID: {p['id']}\n👤 Buyer: {member}\n🧾 Items: {p['items']}\n💰 Total: {format_lkr(p['total'])} LKR\n\nApprove: /approve {p['id']}\nReject: /reject {p['id']}", data)
+            reply = "✅ বাজারটা admin approval-এ পাঠানো হয়েছে।"
             await update.message.reply_text(reply)
             await asyncio.to_thread(save_chat_log, uid, member, text, reply, "BAZAR_OK")
             return
+        if pending and pending.get("type") == "NEED":
+            p = pending
+            user_pending.pop(uid, None)
+            saved_ids = []
+            for item in p["items"]:
+                need_id = generate_id("ND")
+                saved_ids.append((need_id, item))
+                await asyncio.to_thread(append_row, NEED_LIST_SHEET, [need_id, now_str(), uid, member, item, "WAITING_ADMIN", "", "", p["raw"], ""])
+            admin_msg = "📝 NEED LIST APPROVAL দরকার\n\n" + f"👤 Added by: {member}\n"
+            for need_id, item in saved_ids:
+                admin_msg += f"\n• {item}\nApprove: /needapprove {need_id}\nReject: /needreject {need_id}\n"
+            await send_admin(context.bot, admin_msg, data)
+            reply = "✅ লিস্টটা admin approval-এ পাঠানো হয়েছে।"
+            await update.message.reply_text(reply)
+            await asyncio.to_thread(save_chat_log, uid, member, text, reply, "NEED_OK")
+            return
+        # no pending: let AI reply naturally, not fixed
 
+    if low in ["cancel", "/cancel"]:
+        user_pending.pop(uid, None)
+        await update.message.reply_text("✅ Cancel করা হয়েছে।")
+        return
+
+    # Bazar draft -> ask user confirmation
     bazar = parse_bazar_text(text)
     if bazar:
         pending_id = generate_id("BZ")
-        user_pending_bazar[uid] = {"id": pending_id, "raw": text, "items": bazar["items"], "total": bazar["total"], "note": bazar["note"]}
-        reply = f"🛒 বাজারটা আমি এভাবে বুঝেছি:\n\n👤 Buyer: {member}\n🧾 Items: {bazar['items']}\n💰 Total: {format_lkr(bazar['total'])} LKR\n\nসব ঠিক থাকলে শুধু OK লিখো ✅\nভুল হলে /cancel দিয়ে আবার লিখো।\n\nবাহ ভাই, আজকে তো বাজার mission চালু হয়ে গেছে 😄"
+        user_pending[uid] = {"type": "BAZAR", "id": pending_id, "raw": text, "items": bazar["items"], "total": bazar["total"], "note": bazar["note"]}
+        reply = f"🛒 বাজারটা আমি এভাবে বুঝেছি:\n\n👤 Buyer: {member}\n🧾 Items: {bazar['items']}\n💰 Total: {format_lkr(bazar['total'])} LKR\n\nঠিক থাকলে OK লিখো ✅\nভুল হলে /cancel"
         await update.message.reply_text(reply)
         await asyncio.to_thread(save_chat_log, uid, member, text, reply, "BAZAR_DRAFT")
         return
 
+    # Need draft -> ask user confirmation, do not send admin immediately
     need_items = parse_need_list_text(text)
     if need_items:
-        for item in need_items:
-            await asyncio.to_thread(append_row, NEED_LIST_SHEET, [generate_id("ND"), now_str(), uid, member, item, "PENDING", "", "", text, ""])
-
-        personality_notes = await asyncio.to_thread(get_personality_notes)
-        fun_reply = await asyncio.to_thread(gemini_reply, text, member, personality_notes)
-        if not fun_reply:
-            fun_reply = "যে বাজারে যাবে, এগুলো না কিনলে তার বিচার বসবে 😂"
-
-        reply = "✅ বাজার লিস্টে add করে রাখলাম:\n\n" + "\n".join([f"• {i}" for i in need_items]) + "\n\n" + fun_reply
+        user_pending[uid] = {"type": "NEED", "raw": text, "items": need_items}
+        reply = "📝 বাজার লিস্টে add করার আগে confirm করো:\n\n" + "\n".join([f"• {i}" for i in need_items]) + "\n\nঠিক থাকলে OK লিখো ✅\nভুল হলে /cancel"
         await update.message.reply_text(reply)
-        await send_admin(context.bot, f"📝 NEED LIST UPDATE\n\n👤 Added by: {member}\n" + "\n".join([f"• {i}" for i in need_items]), data)
-        await asyncio.to_thread(save_chat_log, uid, member, text, reply, "NEED_LIST")
+        await asyncio.to_thread(save_chat_log, uid, member, text, reply, "NEED_DRAFT")
         return
 
-    # Auto memory learning: no fixed save message, no manual OK. It writes to sheet, then AI replies naturally.
-    memory = detect_memory_text(text, member, uid)
+    # Auto memory save silently, then AI reply. No fixed memory message.
+    memory = await asyncio.to_thread(ai_extract_memory, text, member, data)
     if memory:
-        await asyncio.to_thread(upsert_user_personality, memory)
-        personality_notes = await asyncio.to_thread(get_personality_notes)
-        ai_text = await asyncio.to_thread(gemini_reply, text, member, personality_notes)
-        reply = ai_text or safe_fun_reply(text, member)
-        await update.message.reply_text(reply)
-        await asyncio.to_thread(save_chat_log, uid, member, text, reply, "MEMORY_CHAT")
-        return
+        await asyncio.to_thread(upsert_user_personality, memory, data)
+        await refresh_cache()
 
-    personality_notes = await asyncio.to_thread(get_personality_notes)
-    ai_text = await asyncio.to_thread(gemini_reply, text, member, personality_notes)
-    reply = ai_text or safe_fun_reply(text, member)
+    ai_text = await asyncio.to_thread(ai_chat_reply, text, member, data)
+    reply = ai_text or "AI reply আসেনি। Gemini key/rate limit check করো।"
     await update.message.reply_text(reply)
     await asyncio.to_thread(save_chat_log, uid, member, text, reply, "CHAT")
 
 
-# =========================================================
-# APP START
-# =========================================================
 async def post_init(application: Application):
     commands = [
         BotCommand("start", "Start bot and show help"),
@@ -1122,31 +1088,25 @@ async def post_init(application: Application):
         BotCommand("cancel", "Cancel pending work"),
         BotCommand("id", "My Telegram ID"),
         BotCommand("debug", "Check Google Sheet connection"),
-        BotCommand("refresh", "Admin only refresh cache"),
-        BotCommand("repair_on", "Admin only repair mode ON"),
-        BotCommand("repair_off", "Admin only repair mode OFF"),
+        BotCommand("refresh", "Admin refresh cache"),
+        BotCommand("repair_on", "Repair mode ON"),
+        BotCommand("repair_off", "Repair mode OFF"),
         BotCommand("status", "Bot status"),
-        BotCommand("approve", "Admin approve pending bazar"),
-        BotCommand("reject", "Admin reject pending bazar"),
+        BotCommand("approve", "Approve pending bazar"),
+        BotCommand("reject", "Reject pending bazar"),
+        BotCommand("needapprove", "Approve need item"),
+        BotCommand("needreject", "Reject need item"),
     ]
     await application.bot.set_my_commands(commands)
-    try:
-        await asyncio.to_thread(ensure_extra_sheets)
-    except Exception as exc:
-        print("ensure_extra_sheets failed:", exc)
     asyncio.create_task(auto_scan_loop(application.bot))
 
 
 def main():
     require_env()
-    print("Market Hisab Bot is running...")
+    print("Market Hisab Bot Clean V2 running...")
     print("Spreadsheet ID:", SPREADSHEET_ID)
     print("Service account:", get_service_account_email())
-    print("Cache TTL:", CACHE_TTL_SECONDS)
-    print("Scan interval:", SCAN_INTERVAL_SECONDS)
-    print("Admin IDs:", ADMIN_USER_IDS)
     print("AI Enabled:", AI_ENABLED)
-
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -1163,8 +1123,11 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
     app.add_handler(CommandHandler("reject", reject_cmd))
+    app.add_handler(CommandHandler("needapprove", needapprove_cmd))
+    app.add_handler(CommandHandler("needreject", needreject_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, normal_message_handler))
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
