@@ -17,7 +17,7 @@ import asyncio
 import traceback
 import requests
 import random
-from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
 import gspread
@@ -48,6 +48,10 @@ TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini").strip()
 AI_PROVIDER = os.getenv("AI_PROVIDER", "openai").strip().lower()
 
 ROAST_LEVEL = os.getenv("ROAST_LEVEL", "savage").strip().lower()
+OFFICE_GROUP_ID = os.getenv("OFFICE_GROUP_ID", "").strip()
+SRI_LANKA_TZ = os.getenv("SRI_LANKA_TZ", "Asia/Colombo").strip()
+DAY_SHIFT_START = os.getenv("DAY_SHIFT_START", "05:00").strip()
+DAY_SHIFT_END = os.getenv("DAY_SHIFT_END", "17:20").strip()
 
 # =========================================================
 # SHEETS
@@ -60,6 +64,7 @@ PENDING_BAZAR_SHEET = "Pending_Bazar"
 NEED_LIST_SHEET = "Need_List"
 USER_PERSONALITY_SHEET = "User_Personality"
 BOT_CHAT_LOG_SHEET = "Bot_Chat_Log"
+OFFICE_USERS_SHEET = "Office_Users"
 
 _cache: Dict[str, Any] = {
     "loaded_at": None,
@@ -945,6 +950,187 @@ Message: {user_text}
     return savage_fallback_reply(user_text, member, data)
 
 # =========================================================
+# OFFICE GROUP SAVAGE MODE
+# =========================================================
+def parse_hhmm(value: str) -> tuple:
+    try:
+        h, m = value.strip().split(":")
+        return int(h), int(m)
+    except Exception:
+        return 5, 0
+
+
+def is_day_shift_now() -> bool:
+    now = datetime.now(ZoneInfo(SRI_LANKA_TZ))
+    start_h, start_m = parse_hhmm(DAY_SHIFT_START)
+    end_h, end_m = parse_hhmm(DAY_SHIFT_END)
+
+    start_minutes = start_h * 60 + start_m
+    end_minutes = end_h * 60 + end_m
+    current_minutes = now.hour * 60 + now.minute
+
+    if start_minutes <= end_minutes:
+        return start_minutes <= current_minutes <= end_minutes
+
+    return current_minutes >= start_minutes or current_minutes <= end_minutes
+
+
+def is_office_group(update: Update) -> bool:
+    if not OFFICE_GROUP_ID or not update.effective_chat:
+        return False
+    return str(update.effective_chat.id).strip() == str(OFFICE_GROUP_ID).strip()
+
+
+def get_office_user_profile(user_id: str) -> Dict[str, str]:
+    rows = get_sheet_rows(OFFICE_USERS_SHEET)
+
+    for row in rows[1:]:
+        saved_id = row_value(row, 0)
+        if str(saved_id).strip() == str(user_id).strip():
+            day_name = row_value(row, 1)
+            night_name = row_value(row, 2)
+            role = row_value(row, 3).upper()
+            roast_level = row_value(row, 4) or "savage"
+            notes = row_value(row, 5)
+
+            active_name = day_name if is_day_shift_now() else night_name
+            if not active_name:
+                active_name = day_name or night_name or "UNKNOWN"
+
+            return {
+                "found": "YES",
+                "user_id": user_id,
+                "name": active_name,
+                "day_name": day_name,
+                "night_name": night_name,
+                "role": role,
+                "roast_level": roast_level,
+                "notes": notes,
+            }
+
+    return {
+        "found": "NO",
+        "user_id": user_id,
+        "name": "UNKNOWN",
+        "day_name": "",
+        "night_name": "",
+        "role": "MEMBER",
+        "roast_level": "savage",
+        "notes": "",
+    }
+
+
+def office_openai_reply(user_text: str, profile: Dict[str, str]) -> Optional[str]:
+    name = profile.get("name", "UNKNOWN")
+    role = profile.get("role", "MEMBER")
+    notes = profile.get("notes", "")
+    shift = "DAY" if is_day_shift_now() else "NIGHT"
+
+    if role in ["ADMIN", "OWNER"] or normalize_name(name) == "ALPHA":
+        prompt = f"""
+তুমি office Telegram group-এর savage funny bot.
+
+User: {name}
+Role: {role}
+Shift: {shift}
+Notes: {notes}
+Message: {user_text}
+
+Rules:
+- AlphA/Admin কে insult করবে না।
+- Admin হলে respect + light funny reply দিবে।
+- Reply বাংলা/Banglish natural হবে।
+- কোনো report/list/debug/JSON না।
+- ১-২ লাইনের মধ্যে।
+- reply যেন মানুষের মতো লাগে।
+"""
+    else:
+        prompt = f"""
+তুমি office Telegram group-এর extreme savage roaster bot.
+
+User name to roast: {name}
+Shift: {shift}
+User notes: {notes}
+Message: {user_text}
+
+Rules:
+- Reply অবশ্যই {name} নাম ধরে হবে।
+- Savage level HIGH: sharp, funny, অপমানজনক friend-group roast vibe.
+- কিন্তু religion/race/health/body/family/sexual বিষয় নিয়ে insult করবে না।
+- threat/violence/real harassment করবে না।
+- fixed template না, প্রতিবার fresh reply।
+- কোনো report/list/debug/JSON না।
+- ১-৩ লাইনের মধ্যে।
+- বাংলা/Banglish mixed natural style.
+- reply এমন হবে যেন office group-এর বন্ধুরা হাসে।
+
+Now give only the reply:
+"""
+
+    return ai_model_call(prompt, max_tokens=140, temperature=1.25)
+
+
+def office_savage_fallback(user_text: str, profile: Dict[str, str]) -> str:
+    name = profile.get("name", "UNKNOWN")
+    role = profile.get("role", "MEMBER")
+
+    if role in ["ADMIN", "OWNER"] or normalize_name(name) == "ALPHA":
+        return f"{name} ভাই বলছে মানে group একটু straight হও, নাহলে bot-ও attendance কেটে দিবে 😄"
+
+    words = [w for w in re.split(r"\s+", user_text.strip()) if len(w) > 2]
+    keyword = random.choice(words) if words else "এই কথা"
+
+    lines = [
+        f"{name}, {keyword} নিয়ে এত confidence দেখাচ্ছো কেন? তোমার নিজের system-ই তো pending update 😂",
+        f"{name} আবার কথা বলছে? group-এর শান্তি আজ officially শেষ 😭😂",
+        f"{name}, তোমার logic দেখে calculator-ও resign দিতে চাইবে 😏",
+        f"{name} ভাই, এই কথা বলার আগে mirror check করা উচিত ছিল 😂",
+        f"{name}, তোমার কথা শুনে মনে হচ্ছে brain আজ half-day leave নিয়েছে 😭",
+        f"{name} আসছে মানে drama free না, full package সহ এসেছে 😏😂",
+    ]
+    return random.choice(lines)
+
+
+def final_office_group_reply(user_text: str, profile: Dict[str, str]) -> str:
+    ai = office_openai_reply(user_text, profile)
+
+    if ai:
+        text = ai.replace("```", "").strip()
+        text = re.sub(r"\{.*?\}", "", text, flags=re.S)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        bad = ["json", "debug", "analysis", "report", "রিপোর্ট", "বিশ্লেষণ"]
+        if text and not any(x in text.lower() for x in bad):
+            return text[:400]
+
+    return office_savage_fallback(user_text, profile)
+
+
+async def handle_office_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, uid: str) -> bool:
+    if not is_office_group(update):
+        return False
+
+    profile = await asyncio.to_thread(get_office_user_profile, uid)
+
+    try:
+        reply = await asyncio.to_thread(final_office_group_reply, text, profile)
+    except Exception as exc:
+        print("Office savage reply error:", repr(exc))
+        print(traceback.format_exc())
+        reply = office_savage_fallback(text, profile)
+
+    await update.message.reply_text(reply)
+    await asyncio.to_thread(
+        save_chat_log,
+        uid,
+        profile.get("name", "UNKNOWN"),
+        text,
+        reply,
+        "OFFICE_SAVAGE",
+    )
+    return True
+
+# =========================================================
 # COMMANDS
 # =========================================================
 async def send_admin(bot, text: str, data: Dict[str, Any]) -> None:
@@ -1373,6 +1559,9 @@ async def normal_message_handler(update: Update, context: ContextTypes.DEFAULT_T
     data = await get_cached_data()
     member = normalize_name(get_member_name_by_user_id(data, uid) or update.effective_user.first_name or "UNKNOWN")
     low = text.lower().strip()
+        # Office group savage mode. এখানে market/bazar logic চলবে না.
+    if await handle_office_group_message(update, context, text, uid):
+        return
 
     # Confirmation flow: no admin/sheet update until user OK.
     if low in ["ok", "okay", "ওকে", "ঠিক আছে", "হ্যাঁ", "ha", "yes"]:
