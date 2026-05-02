@@ -419,7 +419,7 @@ def parse_bazar_text(text: str) -> Optional[Dict[str, Any]]:
             return {"items": items, "total": total, "note": raw, "type": "বাজার"}
 
     pairs = re.findall(r"([A-Za-z\u0980-\u09FF]+)\s*[:=]?\s*(\d+(?:\.\d+)?)", raw)
-    if len(pairs) >= 2:
+    if len(pairs) >= 1:
         total = sum(float(amount) for _, amount in pairs)
         items = ", ".join(dict.fromkeys([bangla_item(name) for name, _ in pairs]))
         return {"items": items, "total": total, "note": raw, "type": "বাজার"}
