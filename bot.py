@@ -382,16 +382,21 @@ def build_wallet_message(member_name: str, stats: Dict[str, Any]) -> str:
     m = stats["members"].get(member_name)
     if not m:
         return "❌ Wallet data পাওয়া যায়নি।"
+
     return (
         "💼 MY WALLET STATUS\n\n"
         f"👤 Member: {member_name}\n"
-        f"📅 Month: {stats['month']}\n"
-        f"➕ Top-up: {format_lkr(m['topup'])} LKR\n"
-        f"🛒 Own Bazar: {format_lkr(m['own_expense'])} LKR\n"
-        f"👥 Monthly Share: {format_lkr(m['share_deduction'])} LKR\n"
+        f"📅 Month: {stats['month']}\n\n"
+
+        f"📦 Opening Wallet: {format_lkr(m['opening_wallet'])} LKR\n"
+        f"➕ This Month Top-up: {format_lkr(m['topup'])} LKR\n"
+        f"🛒 Own Bazar This Month: {format_lkr(m['own_expense'])} LKR\n"
+        f"👥 This Month Share: {format_lkr(m['share_deduction'])} LKR\n\n"
+
         f"💰 Current Wallet: {format_lkr(m['wallet'])} LKR\n"
         f"📌 Status: {m['status']}\n\n"
-        f"📊 Month Total Expense: {format_lkr(stats['total_expense'])} LKR\n"
+
+        f"📊 This Month Total Expense: {format_lkr(stats['total_expense'])} LKR\n"
         f"💼 Total Wallet Left: {format_lkr(stats['total_wallet_left'])} LKR"
     )
 
@@ -399,19 +404,24 @@ def build_summary_message(stats: Dict[str, Any]) -> str:
     msg = (
         "📊 CURRENT MONTH SUMMARY\n\n"
         f"📅 Month: {stats['month']}\n"
-        f"➕ Total Top-up: {format_lkr(stats['total_topup'])} LKR\n"
-        f"🛒 Total Bazar: {format_lkr(stats['total_expense'])} LKR\n"
-        f"👥 Per Person Share: {format_lkr(stats['share_per_head'])} LKR\n"
+        f"📦 Previous Carry Expense: {format_lkr(stats['previous_total_expense'])} LKR\n"
+        f"➕ This Month Top-up: {format_lkr(stats['total_topup'])} LKR\n"
+        f"🛒 This Month Bazar: {format_lkr(stats['total_expense'])} LKR\n"
+        f"👥 This Month Per Person Share: {format_lkr(stats['share_per_head'])} LKR\n"
         f"💼 Total Wallet Left: {format_lkr(stats['total_wallet_left'])} LKR\n\n"
     )
+
     for name, m in stats["members"].items():
         msg += (
             f"👤 {name}\n"
-            f"➕ Top-up: {format_lkr(m['topup'])} LKR\n"
+            f"📦 Opening Wallet: {format_lkr(m['opening_wallet'])} LKR\n"
+            f"➕ This Month Top-up: {format_lkr(m['topup'])} LKR\n"
             f"🛒 Own Bazar: {format_lkr(m['own_expense'])} LKR\n"
-            f"💰 Wallet: {format_lkr(m['wallet'])} LKR\n"
+            f"👥 This Month Share: {format_lkr(m['share_deduction'])} LKR\n"
+            f"💰 Current Wallet: {format_lkr(m['wallet'])} LKR\n"
             f"📌 Status: {m['status']}\n\n"
         )
+
     return msg
 
 def build_bazar_message(entry: Dict[str, Any], stats: Dict[str, Any], member_name: str) -> str:
