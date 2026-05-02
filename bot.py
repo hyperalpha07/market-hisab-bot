@@ -177,45 +177,97 @@ def build_stats_from_rows(data: Dict[str, Any]) -> Dict[str, Any]:
     stats = {
         "month": month_key,
         "threshold": threshold,
+
+        # এই মাসের summary
         "total_topup": 0.0,
         "total_expense": 0.0,
         "share_per_head": 0.0,
+
+        # selected month-এর আগের carry-forward হিসাব
+        "previous_total_topup": 0.0,
+        "previous_total_expense": 0.0,
+        "previous_share_per_head": 0.0,
+
+        # current wallet total
         "total_wallet_left": 0.0,
         "members": {},
     }
 
     for name in members:
         stats["members"][name] = {
+            # previous/carry
+            "previous_topup": 0.0,
+            "previous_share_deduction": 0.0,
+            "opening_wallet": 0.0,
+
+            # current month
             "topup": 0.0,
             "own_expense": 0.0,
             "share_deduction": 0.0,
+
+            # final
             "wallet": 0.0,
             "status": "OK",
         }
 
+    member_count = max(len(stats["members"]), 1)
+
+    # Payment হিসাব
     for row in data["payment_rows"][3:]:
         row_month = month_from_date(row_value(row, 0))
         member = normalize_name(row_value(row, 1))
         amount = parse_amount(row_value(row, 2))
-        if row_month == month_key and member in stats["members"] and amount:
+
+        if not row_month or member not in stats["members"] or not amount:
+            continue
+
+        # selected month-এর আগের payment = carry-forward top-up
+        if row_month < month_key:
+            stats["members"][member]["previous_topup"] += amount
+            stats["previous_total_topup"] += amount
+
+        # selected month-এর payment = current month top-up
+        elif row_month == month_key:
             stats["members"][member]["topup"] += amount
             stats["total_topup"] += amount
 
+    # Bazar হিসাব
     for row in data["bazar_rows"][3:]:
         row_month = month_from_date(row_value(row, 0))
         buyer = normalize_name(row_value(row, 1))
         total = parse_amount(row_value(row, 3))
-        if row_month == month_key and total:
+
+        if not row_month or not total:
+            continue
+
+        # selected month-এর আগের bazar = carry-forward deduction
+        if row_month < month_key:
+            stats["previous_total_expense"] += total
+
+        # selected month-এর bazar = current month expense
+        elif row_month == month_key:
             stats["total_expense"] += total
+
             if buyer in stats["members"]:
                 stats["members"][buyer]["own_expense"] += total
 
-    count = max(len(stats["members"]), 1)
-    stats["share_per_head"] = stats["total_expense"] / count
+    # আগের সব bazar সবার মধ্যে ভাগ
+    stats["previous_share_per_head"] = stats["previous_total_expense"] / member_count
+
+    # এই মাসের bazar সবার মধ্যে ভাগ
+    stats["share_per_head"] = stats["total_expense"] / member_count
 
     for name, m in stats["members"].items():
+        # previous wallet = আগের সব top-up - আগের সব bazar share
+        m["previous_share_deduction"] = stats["previous_share_per_head"]
+        m["opening_wallet"] = m["previous_topup"] - m["previous_share_deduction"]
+
+        # current month deduction
         m["share_deduction"] = stats["share_per_head"]
-        m["wallet"] = m["topup"] - m["share_deduction"]
+
+        # final wallet = previous wallet + this month topup - this month share
+        m["wallet"] = m["opening_wallet"] + m["topup"] - m["share_deduction"]
+
         m["status"] = get_wallet_status(m["wallet"], threshold)
         stats["total_wallet_left"] += m["wallet"]
 
