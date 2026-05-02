@@ -405,10 +405,17 @@ def normalize_items_text(text: str) -> str:
 def parse_bazar_text(text: str) -> Optional[Dict[str, Any]]:
     raw = text.strip()
     low = raw.lower()
+
+    # Need-list type message হলে bazar হিসেবে ধরবে না
+    need_words = ["শেষ", "ses", "shesh", "নেই", "nai", "লাগবে", "dorkar", "need", "প্রয়োজন", "proyojon"]
+    if any(w in low for w in need_words):
+        return None
+
     numbers = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", low)]
     if not numbers:
         return None
 
+    # Example: total 3000 chal dal tel
     total_match = re.search(r"(total|মোট|mot)\s*[:=]?\s*(\d+(?:\.\d+)?)", low)
     if total_match:
         total = float(total_match.group(2))
@@ -418,7 +425,10 @@ def parse_bazar_text(text: str) -> Optional[Dict[str, Any]]:
         if items:
             return {"items": items, "total": total, "note": raw, "type": "বাজার"}
 
+    # Example: chal 3000 / cal 3000 / চাল 3000
     pairs = re.findall(r"([A-Za-z\u0980-\u09FF]+)\s*[:=]?\s*(\d+(?:\.\d+)?)", raw)
+
+    # আগে ছিল len(pairs) >= 2, এখন single item bazar-ও ধরবে
     if len(pairs) >= 1:
         total = sum(float(amount) for _, amount in pairs)
         items = ", ".join(dict.fromkeys([bangla_item(name) for name, _ in pairs]))
@@ -429,30 +439,67 @@ def parse_bazar_text(text: str) -> Optional[Dict[str, Any]]:
 def parse_need_list_text(text: str) -> List[str]:
     raw = text.strip()
     low = raw.lower()
-    need_words = ["শেষ", "ses", "shesh", "নেই", "nai", "ফুরিয়ে", "ফুরাইছে"]
+
+    need_words = ["শেষ", "ses", "shesh", "নেই", "nai", "লাগবে", "dorkar", "need", "প্রয়োজন", "proyojon"]
 
     if not any(w in low for w in need_words):
         return []
 
-    cleaned = low
-    for w in need_words:
-        cleaned = cleaned.replace(w, " ")
+    # comma/newline দিয়ে part ভাগ করবো
+    chunks = re.split(r"[,।\n]+", raw)
 
-    cleaned = re.sub(r"[^\w\u0980-\u09FF\s,]", " ", cleaned)
-    parts = re.split(r"[,\s]+", cleaned)
+    quantity_units = {
+        "kg", "kgs", "kilo", "keji", "কেজি", "কেজী",
+        "gram", "grams", "gm", "g", "গ্রাম",
+        "liter", "litre", "l", "ltr", "লিটার",
+        "ta", "টা", "pcs", "piece", "পিস",
+    }
 
     ignore = {
         "ajke", "aaj", "আজকে", "আজ", "amader", "আমাদের", "ar", "আর",
-        "o", "ও", "ta", "টা", "ki", "কি", "hobe", "হবে", "kinte", "কিনতে",
+        "o", "ও", "ki", "কি", "hobe", "হবে", "kinte", "কিনতে",
         "to", "তো", "e", "এই", "oi", "ওই", "amar", "amr", "আমার", "tomar", "তোমার",
+        "bazar", "বাজার", "list", "লিস্ট", "lagbe", "লাগবে",
+        "ses", "shesh", "শেষ", "nai", "নাই", "নেই", "need", "dorkar", "প্রয়োজন",
     }
 
     items = []
-    for p in parts:
-        p = p.strip()
-        if not p or p in ignore:
+
+    for chunk in chunks:
+        c = chunk.strip()
+        if not c:
             continue
-        item = bangla_item(p)
+
+        c_low = c.lower()
+
+        # need word remove
+        for w in need_words:
+            c_low = c_low.replace(w, " ")
+
+        # number remove
+        c_low = re.sub(r"\d+(?:\.\d+)?", " ", c_low)
+
+        # punctuation remove
+        c_low = re.sub(r"[^\w\u0980-\u09FF\s]", " ", c_low)
+
+        words = []
+        for p in re.split(r"\s+", c_low):
+            p = p.strip()
+            if not p:
+                continue
+            if p in ignore:
+                continue
+            if p in quantity_units:
+                continue
+            words.append(p)
+
+        if not words:
+            continue
+
+        # সাধারণত প্রথম valid word-টাই item
+        # যেমন: "পেঁয়াজ ২ কেজি ses" -> পেঁয়াজ
+        item = bangla_item(words[0])
+
         if item and item not in items:
             items.append(item)
 
@@ -971,6 +1018,22 @@ async def normal_message_handler(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("✅ Cancel করা হয়েছে।")
         return
 
+        # 1) আগে need-list ধরবে
+    need_items = parse_need_list_text(text)
+    if need_items:
+        user_pending[uid] = {"type": "NEED", "raw": text, "items": need_items}
+
+        reply = (
+            "📝 বাজার লিস্টে add করার আগে confirm করো:\n\n"
+            + "\n".join([f"• {i}" for i in need_items])
+            + "\n\nঠিক থাকলে OK লিখো ✅\nভুল হলে /cancel"
+        )
+
+        await update.message.reply_text(reply)
+        await asyncio.to_thread(save_chat_log, uid, member, text, reply, "NEED_DRAFT")
+        return
+
+    # 2) এরপর actual bazar expense ধরবে
     bazar = parse_bazar_text(text)
     if bazar:
         pending_id = generate_id("BZ")
@@ -994,24 +1057,6 @@ async def normal_message_handler(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(reply)
         await asyncio.to_thread(save_chat_log, uid, member, text, reply, "BAZAR_DRAFT")
         return
-
-    need_items = parse_need_list_text(text)
-    if need_items:
-        user_pending[uid] = {"type": "NEED", "raw": text, "items": need_items}
-
-        reply = (
-            "📝 বাজার লিস্টে add করার আগে confirm করো:\n\n"
-            + "\n".join([f"• {i}" for i in need_items])
-            + "\n\nঠিক থাকলে OK লিখো ✅\nভুল হলে /cancel"
-        )
-
-        await update.message.reply_text(reply)
-        await asyncio.to_thread(save_chat_log, uid, member, text, reply, "NEED_DRAFT")
-        return
-
-    # No roast / no AI chat.
-    # Unknown normal chat ignored silently.
-    return
 
 async def post_init(application: Application):
     commands = [
